@@ -201,6 +201,10 @@ explains why each measure works or fails.
 - **Short clips.** A clip under about 2 minutes has too few windows for a background of its own, so `detect`
   compares it with a calibrated noise model and reports `status: limited`. A clip shorter than `--min-dur`
   (15 s; 12 s in `audit`) cannot produce an event and is reported as `insufficient`, never as "nothing found".
+- **Overlapping passes.** `detect` separates passes divided by a quiet gap or by a rise in frequency. Two
+  aircraft audible at the same time can still end up in one box. Such a box carries a warning when its ridge
+  rises again or falls further than one pass can, and `audit` counts it as two. Rising tones are never counted
+  as fly-overs.
 
 ## Responsible use
 

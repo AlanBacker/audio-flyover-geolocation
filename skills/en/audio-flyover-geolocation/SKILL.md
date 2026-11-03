@@ -107,6 +107,10 @@ Key points:
   clip judged against the calibrated noise model, or mostly gated audio) and `insufficient` (clip shorter than
   `--min-dur`, or almost everything gated) come with `reasons`: read them, inspect `rec.png`, and lower
   `--min-dur` for short clips.
+- Each event carries `trend` (`descending` or `flat`) and `drop_pct`. A ridge that rises in frequency is not a
+  fly-over: it is listed under `rejected` in `boxes.diag.json`, not in `boxes.json`. `warnings` on an event mean
+  its ridge does what one pass cannot (rises again, or falls by more than 45 %): it probably joins two aircraft
+  or two harmonics. Inspect it with `plot` and trace each part in its own narrow box.
 - `--win`: use 0.5–1 s for close, steep curves and 2–4 s for distant or faint ones. For a faint curve, zoom in
   with `plot` and confirm it by eye first. Then give `trace` a narrow box containing **only one harmonic**, and
   if needed add a few manual points with `--anchors "t:f,t:f,..."`.
@@ -239,6 +243,8 @@ explicitly that the result is "ambiguous".
 |---|---|---|
 | fit gives v≈280 m/s or d=60 km | The trace ran onto noise or jumped between harmonics | Narrow to a single-harmonic box; use `--anchors`; inspect with `plot` before tracing |
 | `detect` finds nothing in a short clip | `status` is `insufficient` (clip shorter than `--min-dur`) or the curve is weak | Read `boxes.diag.json`; lower `--min-dur`; look at `rec.png` and trace by hand with `--anchors` |
+| An event has `warnings`, or one box spans two curves | Two aircraft audible at the same time, or the ridge jumped between harmonics | `plot` the box; trace each curve in its own box; `detect --window 20 --step 5` separates closer passes |
+| A visible tone is missing from `boxes.json` | Its ridge rises, so it is listed under `rejected` in `boxes.diag.json` | A straight pass never rises; if it is a turning aircraft, trace it by hand with `--no-monotone`, not as a primary event |
 | Empty funnel | Windows too narrow / wrong altitude datum / missing ADS-B / wrong time window | First widen `--v-margin/--k-margin/--c-uncert`; check QNH and `--start/--end`; check `--event-classes` |
 | Many candidates with similar scores | One event with no clock, near-parallel tracks, or a curve that is too short | Add a second event, pin down the clock, report a strip |
 | Best point's rec_start differs from metadata by tens of seconds | The metadata is the export/upload time | Trust the acoustic result and explain it in the report |
@@ -249,9 +255,12 @@ explicitly that the result is "ambiguous".
 ```bash
 $AFG audit my_video.mp4 --out work/audit
 ```
-This outputs candidate fly-overs, the detection status and a risk level. `undetermined` means the automatic
-check could not decide (for example a clip shorter than 12 s, or a tonal ridge too short to judge); it is not a
-pass. Even `low` only covers sustained aircraft tones this detector can see, so always look at the PNG.
+This outputs candidate fly-overs, the detection status and a risk level. Only ridges that fall in frequency
+count as fly-overs: rising tones are set aside (`detection.rejected`, mentioned in `notes`), and a candidate
+with `warnings` counts as two. `undetermined` means the automatic check could not decide (for example a clip
+shorter than 12 s, a tonal ridge too short or too flat to judge, or a rising tone that may hide a fly-over); it
+is not a pass. A file shorter than the 1 s analysis window is `undetermined` with no PNG. Even `low` only covers
+sustained aircraft tones this detector can see, so always look at the PNG.
 
 **What works**:
 - **Cut** at least one fly-over, or break the time gap between two fly-overs.

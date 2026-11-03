@@ -26,6 +26,9 @@ replacing it) is reliable; signal-processing "masking" mostly fails.**
 3. If risk is medium/high: cut the fly-over or replace the audio, then audit again.
 4. If risk is `undetermined` or `low, limited check`, the automatic check did not clear the file: read
    `detection.reasons` and decide from the PNG.
+5. Only falling ridges count as fly-overs. A candidate with `warnings` (its ridge rises again, or falls further
+   than one pass can) counts as two. Rising tones are listed in `detection.rejected` and in `notes`; check in
+   the PNG that no falling curve hides under them.
 
 ## Points to explain to the user
 

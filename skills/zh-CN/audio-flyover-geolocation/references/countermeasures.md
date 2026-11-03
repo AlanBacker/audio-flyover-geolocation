@@ -21,6 +21,8 @@
 3. 若 risk 为 medium/high：剪掉飞越段或替换声轨后重新 audit。
 4. 若 risk 为 `undetermined` 或 `low, limited check`：自动检查并未放行该文件，请阅读 `detection.reasons`
    并以 PNG 为准。
+5. 只有频率下降的脊线才算飞越。带 `warnings` 的候选（脊线再次上升，或下降幅度超出单次飞越的可能）按两次计。
+   上升音调列在 `detection.rejected` 和 `notes` 中；请在 PNG 中确认其下没有藏着下降曲线。
 
 ## 解释给用户的要点
 

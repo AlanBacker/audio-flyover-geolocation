@@ -70,6 +70,35 @@ def spec_of(x):
     return audio.compute_spectrogram(x, FS, 1.0, 0.2, 20, 600, 120)
 
 
+def burst(dur, tc, half=13.0, **kw):
+    """A pass audible only for about +-half s around tc (26 s events with 2 s fades)."""
+    x = flyby(dur, tc=tc, **kw)
+    t = np.arange(x.size) / FS
+    return x * np.clip((half - np.abs(t - tc)) / 2.0, 0, 1)
+
+
+def two_passes(rising_tone=False):
+    """The second defect report's construction: passes at 45 s and 135 s of a 180 s recording."""
+    x = ambient(180, 21) + burst(180, 45.0, f0=105, v=60, d=250) + burst(180, 135.0, f0=95, v=55, d=300)
+    if rising_tone:                                  # a quieter tone climbing 70 -> 115 Hz under both
+        t = np.arange(x.size) / FS
+        x = x + 0.004 * np.sin(2 * np.pi * np.cumsum(70 + 0.25 * t) / FS)
+    return x
+
+
+def pass_under_tone():
+    """A loud rising tone with a brief pass (about 10 s) underneath it: the ridge follows the tone."""
+    t = np.arange(60 * FS) / FS
+    return (ambient(60, 31) + 0.01 * np.sin(2 * np.pi * np.cumsum(70 + 0.5 * t) / FS)
+            + burst(60, 30.0, half=4.0, f0=110, v=60, d=200, amp=0.01))
+
+
+def rising_tone(dur=30):
+    """A test tone sweeping up from 100 Hz at 1.2 Hz/s: tonal, but no fly-over can rise."""
+    t = np.arange(int(dur * FS)) / FS
+    return np.sin(2 * np.pi * np.cumsum(100 + 1.2 * t) / FS) + 0.05 * np.random.default_rng(3).normal(size=t.size)
+
+
 class HarmonicSum(unittest.TestCase):
     def setUp(self):
         f = np.arange(18.0, 600.01, 0.25)
@@ -128,6 +157,73 @@ class ShortRecordings(unittest.TestCase):
         self.assertEqual(ev, [])
         self.assertEqual(info["status"], "insufficient")
 
+    def test_a_few_frames_do_not_crash(self):
+        for dur, frames in ((1.0, 1), (1.4, 3), (1.8, 5), (2.0, 6)):
+            with self.subTest(dur=dur):
+                spec = spec_of(np.zeros(int(dur * FS)))
+                self.assertEqual(spec["t"].size, frames)
+                self.assertEqual(spec["gated"].shape, spec["t"].shape)
+                ev, info = audio.detect_events(spec, return_info=True)
+                self.assertEqual(ev, [])
+                self.assertEqual(info["status"], "insufficient")
+                self.assertEqual(info["rejected"], [])
+        with self.assertRaises(ValueError):          # less than one analysis window: callers report it
+            spec_of(np.zeros(int(0.7 * FS)))
+
+
+class SeparatePasses(unittest.TestCase):
+    def check_two(self, ev):
+        self.assertEqual(len(ev), 2, [(e["core_t0"], e["core_t1"]) for e in ev])
+        for e, tc in zip(sorted(ev, key=lambda e: e["t0"]), (45.0, 135.0)):
+            self.assertLess(e["core_t0"], tc)
+            self.assertGreater(e["core_t1"], tc)
+            self.assertLess(e["t1"] - e["t0"], 90.0)
+            self.assertEqual(e["trend"], "descending")
+        self.assertLessEqual(ev[0]["t1"], ev[1]["t0"])
+
+    def test_two_passes_a_minute_apart(self):
+        spec = spec_of(two_passes())
+        for kw in ({}, {"win_s": 20.0, "step_s": 5.0}):
+            with self.subTest(**kw):
+                self.check_two(audio.detect_events(spec, **kw))
+
+    def test_two_passes_over_a_rising_tone(self):
+        ev, info = audio.detect_events(spec_of(two_passes(rising_tone=True)), return_info=True)
+        self.check_two(ev)
+        self.assertTrue(info["rejected"])
+        self.assertTrue(all(e["trend"] == "rising" for e in info["rejected"]))
+
+
+class Trend(unittest.TestCase):
+    def test_flyover_falls(self):
+        ev = audio.detect_events(spec_of(strong(20)))
+        self.assertEqual(ev[0]["trend"], "descending")
+        self.assertGreater(ev[0]["drop_pct"], 5.0)
+        self.assertEqual(ev[0]["warnings"], [])
+
+    def test_rising_tone_is_set_aside(self):
+        ev, info = audio.detect_events(spec_of(rising_tone()), return_info=True)
+        self.assertEqual(ev, [])
+        self.assertEqual(len(info["rejected"]), 1)
+        self.assertEqual(info["rejected"][0]["trend"], "rising")
+        self.assertLess(info["rejected"][0]["drop_pct"], -10.0)
+
+    def test_search_continues_under_a_set_aside_tone(self):
+        ev, info = audio.detect_events(spec_of(pass_under_tone()), min_dur_s=12.0, return_info=True)
+        self.assertEqual(ev, [])
+        self.assertTrue(info["rejected"][0]["warnings"])
+        self.assertTrue(any(h["t0"] < 30.0 < h["t1"] for h in info["short_hits"]), info["short_hits"])
+
+    def test_turning_points(self):
+        tp = audio._turning_points
+        self.assertEqual(tp(np.array([5.0, 5.5, 4.8, 5.2]), 3.0), [0, 3])           # wiggles do not split
+        self.assertEqual(tp(np.r_[np.linspace(120, 90, 30), np.linspace(91, 110, 20)], 3.0), [0, 29, 49])
+        sw = audio._swings(np.r_[np.linspace(120, 90, 30), np.full(10, 90.0), np.linspace(91, 130, 5),
+                                 np.full(10, 130.0), np.linspace(129, 100, 30)], 3.0)
+        self.assertEqual([s[2] for s in sw], [True, False, True])
+        self.assertEqual((sw[1][0], sw[1][1]), (40, 44))   # the flat bottom and top stay with the falls
+        self.assertEqual(tp(np.linspace(70, 115, 50), 3.0), [0, 49])
+
 
 class NoFalseAlarms(unittest.TestCase):
     def test_noise_only(self):
@@ -169,15 +265,55 @@ class Coverage(unittest.TestCase):
         self.assertGreater(max(e["core_t1"] for e in ev), spec["t"][-1] - 1.0)
 
 
+def run_cli(cmd, x, *extra):
+    """Write x as a 16-bit WAV, run one afg_cli command on it, return (exit code, stdout, out prefix files)."""
+    with tempfile.TemporaryDirectory() as d:
+        wav = os.path.join(d, "clip.wav")
+        peak = np.abs(x).max() if x.size else 0.0
+        wavfile.write(wav, FS, (0.9 * x / peak * 32767 if peak else x).astype(np.int16))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = afg_cli.main([cmd, wav, "--out", os.path.join(d, "out"), *extra])
+        return code, buf.getvalue(), sorted(os.listdir(d))
+
+
 class Audit(unittest.TestCase):
     def audit(self, x):
-        with tempfile.TemporaryDirectory() as d:
-            wav = os.path.join(d, "clip.wav")
-            wavfile.write(wav, FS, (0.9 * x / np.abs(x).max() * 32767).astype(np.int16))
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-                afg_cli.main(["audit", wav, "--out", os.path.join(d, "audit")])
-            return json.loads(buf.getvalue())
+        code, stdout, _ = run_cli("audit", x)
+        self.assertEqual(code, 0)
+        return json.loads(stdout)
+
+    def test_rising_tone_is_not_a_flyover(self):
+        out = self.audit(rising_tone())
+        self.assertFalse(out["risk"].startswith(("medium", "high")), out["risk"])
+        self.assertEqual(out["candidate_flyovers"], [])
+        self.assertEqual(len(out["detection"]["rejected"]), 1)
+        self.assertTrue(any("rising" in n for n in out["notes"]))
+
+    def test_pass_under_a_rising_tone_is_not_cleared(self):
+        out = self.audit(pass_under_tone())
+        self.assertTrue(out["risk"].startswith("undetermined"), out["risk"])
+
+    def test_two_separate_passes_are_high(self):
+        out = self.audit(two_passes())
+        self.assertEqual(out["risk"], "high")
+        self.assertEqual(len(out["candidate_flyovers"]), 2)
+
+    def test_very_short_files(self):
+        for dur in (0.0, 0.7, 1.0, 1.4, 2.0):
+            with self.subTest(dur=dur):
+                out = self.audit(np.zeros(int(dur * FS)))
+                self.assertTrue(out["risk"].startswith("undetermined"), out["risk"])
+                self.assertEqual(out["detection"]["status"], "insufficient")
+                self.assertTrue(out["detection"]["reasons"])
+                if dur < 1.0:
+                    self.assertIsNone(out["png"])
+
+    def test_spectrogram_of_a_sub_window_clip_exits_cleanly(self):
+        code, stdout, files = run_cli("spectrogram", np.zeros(int(0.7 * FS)))
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(files, ["clip.wav"])
 
     def test_short_flyover_is_not_low(self):
         out = self.audit(strong(20))

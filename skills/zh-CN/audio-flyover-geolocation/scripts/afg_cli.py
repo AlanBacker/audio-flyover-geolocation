@@ -92,7 +92,11 @@ def _load_events(paths):
 def cmd_spectrogram(a):
     x, fs, nch = audio.load_audio(a.audio, fs=a.fs, channel=a.channel)
     log(f"audio: {len(x) / fs:.1f} s @ {fs} Hz ({nch} ch)")
-    spec = audio.compute_spectrogram(x, fs, a.win, a.hop, a.fmin, a.fmax, a.bg)
+    try:
+        spec = audio.compute_spectrogram(x, fs, a.win, a.hop, a.fmin, a.fmax, a.bg)
+    except ValueError as e:
+        log(f"error: {e}: {len(x) / fs:.2f} s of audio, --win is {a.win:g} s; nothing to analyse")
+        return 2
     audio.save_spec(spec, a.out + ".spec.npz", a.audio)
     audio.plot_spec(spec, a.out + ".png", a.t0, a.t1, a.fmin, a.fmax,
                     title=f"{os.path.basename(a.audio)}  win={a.win}s hop={a.hop}s")
@@ -120,7 +124,9 @@ def cmd_detect(a):
     dump_json(info, diag)
     for i, e in enumerate(ev):
         log(f"event {i + 1}: t={e['t0']:.0f}-{e['t1']:.0f}s f={e['fmin']:.1f}-{e['fmax']:.1f}Hz "
-            f"peak={e['peak_snr_db']:.1f}dB ({e['basis']} baseline)")
+            f"peak={e['peak_snr_db']:.1f}dB ({e['basis']} baseline) {e['trend']}, drop {e['drop_pct']:.1f} %")
+    for e in info.get("rejected", []):
+        log(f"set aside: t={e['core_t0']:.0f}-{e['core_t1']:.0f}s rising {-e['drop_pct']:.1f} % (not a fly-over)")
     log(f"detection status: {info['status']} ({info['n_valid_windows']} usable windows, {info['baseline']} baseline)")
     for r in info["reasons"]:
         log("  -", r)
@@ -383,27 +389,52 @@ def cmd_thunder(a):
 def cmd_audit(a):
     """Privacy audit of YOUR OWN recording before publishing it."""
     x, fs, nch = audio.load_audio(a.audio, fs=4000)
-    spec = audio.compute_spectrogram(x, fs, 1.0, 0.2, 20, 600, 120)
-    ev, info = audio.detect_events(spec, 40, 400, 1, a.thr, 12.0, return_info=True)
     dur = len(x) / fs
-    if len(ev) >= 2:
+    try:
+        spec = audio.compute_spectrogram(x, fs, 1.0, 0.2, 20, 600, 120)
+    except ValueError as e:                  # shorter than the 1 s analysis window
+        spec, ev = None, []
+        info = {"status": "insufficient", "baseline": None, "frames": 0, "n_windows": 0, "n_valid_windows": 0,
+                "reasons": [f"{e} ({dur:.2f} s of audio, the window is 1 s): nothing could be checked"],
+                "short_hits": [], "rejected": []}
+    else:
+        ev, info = audio.detect_events(spec, 40, 400, 1, a.thr, 12.0, return_info=True)
+    # A fly-over falls in frequency. Rising ridges are already set aside by detect; an event with warnings
+    # (ridge rises again, or falls further than one pass can) may hold two passes, and a 'flat' one cannot
+    # be told apart from other tones.
+    falling = [e for e in ev if e["trend"] == "descending"]
+    n_pass = sum(2 if e["warnings"] else 1 for e in falling)
+    flat = [e for e in ev if e["trend"] == "flat"]
+    hidden = [e for e in info["rejected"] if e["warnings"]]
+    notes = []
+    if any(e["warnings"] for e in falling):
+        notes.append("a candidate's ridge does what one fly-over cannot (rises again, or falls further than one "
+                     "pass can), so it probably holds two passes; counted as two")
+    if flat:
+        notes.append(f"{len(flat)} tonal ridge(s) without a clear Doppler fall; inspect them in the PNG")
+    if info["rejected"]:
+        notes.append(f"{len(info['rejected'])} rising tonal ridge(s) set aside: a fly-over always falls in "
+                     f"frequency (see detection.rejected)")
+    if n_pass >= 2:
         risk = "high"
-    elif len(ev) == 1:
+    elif n_pass == 1:
         risk = "medium (high if the recording time is known or the area is small)"
-    elif info["status"] == "insufficient" or info["short_hits"]:
+    elif flat or hidden or info["status"] == "insufficient" or info["short_hits"]:
         risk = "undetermined (the automatic check could not decide; see detection.reasons and inspect the PNG)"
     elif info["status"] == "limited":
         risk = "low, limited check (see detection.reasons; inspect the PNG)"
     else:
         risk = "low"
-    out = {"duration_s": dur, "detection": info, "candidate_flyovers": ev, "risk": risk,
+    out = {"duration_s": dur, "detection": info, "candidate_flyovers": ev, "risk": risk, "notes": notes,
+           "png": a.out + ".png" if spec is not None else None,
            "risk_scope": "covers only sustained aircraft tones (about 40-400 Hz) that this detector can see; "
                          "'low' is not a guarantee - look for smooth descending curves in the PNG",
            "advice": ["cut the audio so no two fly-overs remain with an intact time gap",
                       "replace/strip the audio track, or re-record the narration separately",
                       "a high-pass filter, talking over it, or phone-call codecs do NOT reliably remove it",
                       "also check visual clues, metadata (GPS/EXIF/QuickTime), reflections and voices"]}
-    audio.plot_spec(spec, a.out + ".png", fmin=20, fmax=500, title="audit: look for smooth descending curves")
+    if spec is not None:
+        audio.plot_spec(spec, a.out + ".png", fmin=20, fmax=500, title="audit: look for smooth descending curves")
     dump_json(out, a.out + ".json")
     print(json.dumps(out, indent=2))
 

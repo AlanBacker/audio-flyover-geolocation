@@ -89,6 +89,7 @@ $AFG fit work/e1.csv --temp-c 18 --out work/e1.json  # v, d, tCPA, f0, 搜索窗
 ```
 要点：
 - 只有 `boxes.diag.json` 显示 `status: ok` 时，`boxes.json` 为空才表示"没有飞越"。`limited`（短片段改用校准噪声模型判定，或大部分音频被门控）和 `insufficient`（片段短于 `--min-dur`，或几乎全被门控）会附带 `reasons`：先读原因、看 `rec.png`，短片段可调低 `--min-dur`。
+- 每个事件带 `trend`（`descending` 或 `flat`）和 `drop_pct`。频率上升的脊线不是飞越：它不进 `boxes.json`，而是列在 `boxes.diag.json` 的 `rejected` 中。事件带 `warnings` 表示其脊线做了单次飞越做不到的事（下降后又上升，或下降超过 45 %），多半连接了两架飞机或两条谐波：用 `plot` 查看，并给每一段单独的窄框再追踪。
 - `--win`：近距离陡峭曲线用 0.5–1 s，远/弱曲线用 2–4 s。曲线弱时先 `plot` 放大肉眼确认，再给 `trace` 一个**只含一条谐波**的窄框，必要时用 `--anchors "t:f,t:f,..."` 手工给几个点。
 - 看 `fit` 输出的 `implausible`（非空 = 追踪跑到噪声或跳谐波上，**不要**进入搜索，脚本也会拒绝）和 `notes`（左右残差不对称 = 转弯/变速；近/远速度差 = 爬升或加速）。
 - 已知气温就给 `--temp-c`（c = 20.05·√(T+273.15)）；v、d 都与 c 成正比，不知道温度时保留默认 ±4 %。
@@ -158,6 +159,8 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 |---|---|---|
 | fit 给出 v≈280 m/s 或 d=60 km | 追踪跑到噪声/谐波之间跳 | 缩小到单谐波框；`--anchors`；`plot` 看清后再追 |
 | 短片段里 `detect` 什么都没找到 | `status` 为 `insufficient`（片段短于 `--min-dur`）或曲线太弱 | 看 `boxes.diag.json`；调低 `--min-dur`；看 `rec.png` 并用 `--anchors` 手工追踪 |
+| 事件带 `warnings`，或一个框跨了两条曲线 | 两架飞机同时可闻，或脊线在谐波之间跳 | `plot` 查看该框；每条曲线单独给框追踪；`detect --window 20 --step 5` 可分开更近的飞越 |
+| 图上可见的音调不在 `boxes.json` 里 | 其脊线上升，被列在 `boxes.diag.json` 的 `rejected` 中 | 直线飞越不会上升；若是转弯的飞机，用 `--no-monotone` 手工追踪，不作为主事件 |
 | 漏斗为空 | 窗口过窄 / 高度基准错 / ADS-B 缺失 / 时间窗不对 | 先放宽 `--v-margin/--k-margin/--c-uncert`；检查 QNH、`--start/--end`；确认机型类别 `--event-classes` |
 | 得分接近的大量候选 | 单事件无时钟、航迹近平行、曲线太短 | 加第二事件、确定时钟、报告条带 |
 | 最佳点 rec_start 与元数据差几十秒 | 元数据时间是导出/上传时间 | 以声学结果为准，并在报告中说明 |
@@ -168,8 +171,8 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 ```bash
 $AFG audit my_video.mp4 --out work/audit
 ```
-输出候选飞越、检测状态与风险等级。`undetermined` 表示自动检查无法判断（例如片段短于 12 s，或音调脊线太短无法评估），
-**不代表通过**；即使是 `low`，也只覆盖本检测器能看到的持续飞机音调，务必看 PNG。有效对策：**剪掉**至少一个飞越或破坏两次飞越之间的时间间隔；替换/去除原声轨（重新配音）；
+输出候选飞越、检测状态与风险等级。只有频率下降的脊线才算飞越：上升的音调会被搁置（`detection.rejected`，并写进 `notes`），带 `warnings` 的候选按两次飞越计。`undetermined` 表示自动检查无法判断（例如片段短于 12 s、音调脊线太短或太平无法评估，或上升音调下可能藏着飞越），
+**不代表通过**；短于 1 s 分析窗口的文件为 `undetermined`，不生成 PNG。即使是 `low`，也只覆盖本检测器能看到的持续飞机音调，务必看 PNG。有效对策：**剪掉**至少一个飞越或破坏两次飞越之间的时间间隔；替换/去除原声轨（重新配音）；
 同时清理 GPS/EXIF/QuickTime 元数据和画面线索。**无效**：高通滤波（与人声频段重叠，残留仍可恢复）、
 "盖过去"（窄带音调在频谱里仍突出）、通话降噪（只在静音时门控）。详见 `references/countermeasures.md`。
 

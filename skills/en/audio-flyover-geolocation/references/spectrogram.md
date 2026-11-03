@@ -41,7 +41,30 @@ i.e. win ≲ 1/√|slope|. Example: a CPA slope of 2 Hz/s → win ≲ 0.7 s.
     six self-test recordings within ±0.06 dB. In 73 synthetic noise-only clips (12–300 s, with hum and speech
     bursts) there were no false events, and passes within 1.5 km exceeded it by 1.5–12 dB. Real wind and traffic
     noise were not part of that test.
-- Windows lasting ≥ `--min-dur` are merged into event boxes; shorter hits are listed as `short_hits`.
+- Hit windows are chained into groups. Because windows overlap, a group can span two separate passes, so each
+  group's ridge is split again:
+  - where it loses support (its 5 s mean below the 99.5th percentile of the noise model's) for more than 10 s
+    of ungated audio;
+  - at its turning points, where it rises again by more than max(3 Hz, 3 %). The flat approach and departure
+    stay with their pass.
+
+  A group with a single stretch keeps the window-based box of earlier versions (the six self-tests are
+  unchanged). Stretches lasting ≥ `--min-dur` become events; shorter ones are listed as `short_hits`.
+- Trend: `drop_pct` compares the medians of the first and last 20 % of an event's supported ridge points.
+  - ≥ 1 % → `descending`.
+  - ≤ −1 % → `rising`. It is not returned but listed under `rejected` in `boxes.diag.json`: a straight fly-over
+    always falls, so a rising tone is a test signal, an engine run-up or a turning source. A strong tone hides
+    what lies under it, so its ridge is masked and the stretch searched again. A falling ridge found there
+    becomes an event (with a `note`) or a `short_hits` entry, and the tone gets a warning.
+  - Otherwise → `flat`. It is kept, but check it with `plot`.
+- `warnings` on an event: its ridge rises again by more than the tolerance, or falls by more than 45 % (one
+  pass falls by 2v/(c+v), which is 36 % at 75 m/s). It then probably joins two aircraft or two harmonics.
+- Measured on synthetic recordings:
+  - Two passes 90–180 s apart came out as two events in 12 of 12 cases (v1.1.0: 4 of 12, only at 180 s).
+  - Passes 40–60 s apart that are audible at the same time often stay one box, but every such box carried a
+    warning.
+  - Single passes (150 m–2 km, 144 clips) and 72 noise-only clips gave the same detections as v1.1.0. There
+    were no warnings, and no ridges were set aside.
 - `status` in `boxes.diag.json`: `ok` = an empty result means no fly-over the detector can see; `limited` = the
   noise model was used, or most frames are gated; `insufficient` = the check could not run as configured (clip
   shorter than `--min-dur`, or almost everything gated), so an empty result says nothing.
@@ -70,7 +93,7 @@ Two passes:
 | Green points drift into noise before/after the curve | Tails too faint | Normal; fit uses a robust loss. If it hurts the fit, use `fit --tmin/--tmax` to fit only the clean part |
 | Only a short piece near CPA | Asymptotes not visible | v and d are individually unreliable, but k = v²/d still holds; the search windows are designed for this |
 | A "step" mid-curve | Two aircraft overlapping, or a power change | Separate them with `--anchors`; if needed use only one side |
-| A rising curve | Turning towards you / helicopter manoeuvring | `--no-monotone`; usually unsuitable as a primary event |
+| A rising curve | Turning towards you / helicopter manoeuvring | `detect` lists it under `rejected`; trace it with `--no-monotone` if needed; usually unsuitable as a primary event |
 
 ### Manual anchors
 
