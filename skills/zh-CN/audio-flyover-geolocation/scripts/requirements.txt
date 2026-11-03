@@ -1,0 +1,7 @@
+# core
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+# optional: DEM GeoTIFF sampling (dem-fetch / --dem)
+rasterio>=1.3
+# external (not pip): ffmpeg on PATH for video / compressed audio input

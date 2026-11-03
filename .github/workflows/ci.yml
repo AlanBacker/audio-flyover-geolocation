@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Validate both editions
+        run: python tools/build.py check
+
+  selftest:
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [7, 11, 23, 42, 101, 2026]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "numpy>=1.24" "scipy>=1.10" "matplotlib>=3.7"
+      - name: Blind end-to-end test (seed ${{ matrix.seed }})
+        run: python skills/en/audio-flyover-geolocation/scripts/afg_cli.py selftest --seed ${{ matrix.seed }} --keep out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-seed-${{ matrix.seed }}
+          path: |
+            out/selftest.json
+            out/*.png
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: selftest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python tools/build.py package
+      - name: Attach .skill files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" dist/*.skill --clobber \
+            || gh release create "$GITHUB_REF_NAME" dist/*.skill --title "$GITHUB_REF_NAME" --generate-notes
