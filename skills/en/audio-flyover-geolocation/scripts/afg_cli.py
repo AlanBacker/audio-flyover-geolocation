@@ -112,12 +112,19 @@ def cmd_plot(a):
 
 def cmd_detect(a):
     spec = audio.load_spec(a.spec)
-    ev = audio.detect_events(spec, a.fmin, a.fmax, a.harmonics, a.thr, a.min_dur)
+    ev, info = audio.detect_events(spec, a.fmin, a.fmax, a.harmonics, a.thr, a.min_dur, win_s=a.window,
+                                   step_s=a.step, null_db=a.null_db, return_info=True)
     ev.sort(key=lambda e: e["t0"])
     dump_json(ev, a.out)
+    diag = os.path.splitext(a.out)[0] + ".diag.json"
+    dump_json(info, diag)
     for i, e in enumerate(ev):
-        log(f"event {i + 1}: t={e['t0']:.0f}-{e['t1']:.0f}s f={e['fmin']:.1f}-{e['fmax']:.1f}Hz peak={e['peak_snr_db']:.1f}dB")
-    print(json.dumps(ev, indent=2))
+        log(f"event {i + 1}: t={e['t0']:.0f}-{e['t1']:.0f}s f={e['fmin']:.1f}-{e['fmax']:.1f}Hz "
+            f"peak={e['peak_snr_db']:.1f}dB ({e['basis']} baseline)")
+    log(f"detection status: {info['status']} ({info['n_valid_windows']} usable windows, {info['baseline']} baseline)")
+    for r in info["reasons"]:
+        log("  -", r)
+    print(json.dumps({"detection": info, "diag": diag, "events": ev}, indent=2))
 
 
 def cmd_trace(a):
@@ -135,7 +142,11 @@ def cmd_trace(a):
             fh.write("%.3f,%.4f,%.2f\n" % row)
     png = os.path.splitext(a.out)[0] + ".png"
     audio.plot_spec(spec, png, a.t0, a.t1, a.fmin, a.fmax, points=(t, f), title="trace " + os.path.basename(a.out))
-    print(json.dumps({"points": int(t.size), "csv": a.out, "png": png,
+    k = audio.harmonics_used(spec, a.fmax, a.harmonics)
+    if k < a.harmonics:
+        log(f"note: only {k} of {a.harmonics} harmonics fit under the spectrogram top ({spec['f'][-1]:.0f} Hz) "
+            f"for --fmax {a.fmax:g}; a narrower box around one harmonic stacks more")
+    print(json.dumps({"points": int(t.size), "csv": a.out, "png": png, "harmonics_used": k,
                       "f_range": [float(f.min()), float(f.max())] if t.size else None}, indent=2))
 
 
@@ -373,14 +384,21 @@ def cmd_audit(a):
     """Privacy audit of YOUR OWN recording before publishing it."""
     x, fs, nch = audio.load_audio(a.audio, fs=4000)
     spec = audio.compute_spectrogram(x, fs, 1.0, 0.2, 20, 600, 120)
-    ev = audio.detect_events(spec, 40, 400, 3, a.thr, 12.0)
+    ev, info = audio.detect_events(spec, 40, 400, 1, a.thr, 12.0, return_info=True)
     dur = len(x) / fs
-    risk = "low"
     if len(ev) >= 2:
         risk = "high"
     elif len(ev) == 1:
         risk = "medium (high if the recording time is known or the area is small)"
-    out = {"duration_s": dur, "candidate_flyovers": ev, "risk": risk,
+    elif info["status"] == "insufficient" or info["short_hits"]:
+        risk = "undetermined (the automatic check could not decide; see detection.reasons and inspect the PNG)"
+    elif info["status"] == "limited":
+        risk = "low, limited check (see detection.reasons; inspect the PNG)"
+    else:
+        risk = "low"
+    out = {"duration_s": dur, "detection": info, "candidate_flyovers": ev, "risk": risk,
+           "risk_scope": "covers only sustained aircraft tones (about 40-400 Hz) that this detector can see; "
+                         "'low' is not a guarantee - look for smooth descending curves in the PNG",
            "advice": ["cut the audio so no two fly-overs remain with an intact time gap",
                       "replace/strip the audio track, or re-record the narration separately",
                       "a high-pass filter, talking over it, or phone-call codecs do NOT reliably remove it",
@@ -409,7 +427,7 @@ def cmd_selftest(a):
     x, fs, _ = audio.load_audio(wav, fs=4000)
     spec = audio.compute_spectrogram(x, fs, 1.0, 0.2, 20, 600, 120)
     audio.save_spec(spec, os.path.join(work, "rec.spec.npz"), wav)
-    boxes = sorted(audio.detect_events(spec, 40, 400, 3), key=lambda e: -e["score_z"])[:2]
+    boxes = sorted(audio.detect_events(spec, 40, 400, 1), key=lambda e: -e["score_z"])[:2]
     boxes.sort(key=lambda e: e["t0"])
     log("detected boxes:", [(round(b["t0"]), round(b["t1"]), round(b["fmin"], 1), round(b["fmax"], 1)) for b in boxes])
     if len(boxes) < 2:
@@ -596,9 +614,14 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--fmin", type=float, default=40)
     s.add_argument("--fmax", type=float, default=400)
-    s.add_argument("--harmonics", type=int, default=3)
+    s.add_argument("--harmonics", type=int, default=1,
+                   help="harmonics stacked per candidate (1 = brightest single line; see references/spectrogram.md)")
     s.add_argument("--thr", type=float, default=0.8, help="min ridge excess (dB) over the recording median")
+    s.add_argument("--null-db", type=float, default=0.8,
+                   help="min ridge excess (dB) over the calibrated noise model (short clips, tonal recordings)")
     s.add_argument("--min-dur", type=float, default=15.0)
+    s.add_argument("--window", type=float, default=60.0, help="detection window (s)")
+    s.add_argument("--step", type=float, default=10.0, help="detection window step (s)")
     s.set_defaults(fn=cmd_detect)
 
     s = sub.add_parser("trace", help="trace one Doppler curve inside a time/frequency box -> CSV")

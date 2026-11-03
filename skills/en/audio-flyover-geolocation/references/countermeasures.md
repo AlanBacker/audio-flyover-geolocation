@@ -24,6 +24,8 @@ replacing it) is reliable; signal-processing "masking" mostly fails.**
    - other ambient sounds (bells, PA announcements, trains);
    - ENF (mains frequency), which can also be used for time forensics.
 3. If risk is medium/high: cut the fly-over or replace the audio, then audit again.
+4. If risk is `undetermined` or `low, limited check`, the automatic check did not clear the file: read
+   `detection.reasons` and decide from the PNG.
 
 ## Points to explain to the user
 

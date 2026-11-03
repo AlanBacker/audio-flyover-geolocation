@@ -167,8 +167,8 @@ bash examples/synthetic_demo.sh work/demo 23
 
 大多数"遮掩"都无效：高通滤波、盖上音乐、电话通话编码，窄带音调都还能恢复。
 有效的是去掉信息本身：剪掉飞越片段、改变两次飞越之间的时间间隔，或替换整条音轨。
-发布前运行 `afg_cli.py audit my.mp4 --out work/audit`。
-每种措施为什么有效或无效，见 skill 的[隐私对策文档](skills/zh-CN/audio-flyover-geolocation/references/countermeasures.md)。
+发布前运行 `afg_cli.py audit my.mp4 --out work/audit`。风险为 `undetermined` 表示自动检查无法判断（例如片段短于 12 s），
+不代表通过。每种措施为什么有效或无效，见 skill 的[隐私对策文档](skills/zh-CN/audio-flyover-geolocation/references/countermeasures.md)。
 
 ## 局限
 
@@ -183,6 +183,9 @@ bash examples/synthetic_demo.sh work/demo 23
 
   流水线会报告这些情况，但无法消除它们。
 - **素材。** 改变事件间时间差的剪辑会让双事件法失效；变速会让一切按比例缩放。
+- **短片段。** 短于约 2 分钟的片段窗口太少，无法用自身背景作基线，`detect` 改为与校准噪声模型比较，并报告
+  `status: limited`。短于 `--min-dur`（15 s；`audit` 中为 12 s）的片段不可能产生事件，会报告为 `insufficient`，
+  而不是"什么都没有"。
 
 ## 合理使用
 
@@ -208,13 +211,14 @@ skills/
 tools/build.py                       check | sync | package
 tools/make_figures.py                由一次流水线运行重绘 docs/images
 examples/synthetic_demo.sh           合成数据上的端到端命令行示例
+tests/test_detection.py              检测与自查的回归测试（合成数据）
 ```
 
 - `python tools/build.py check` 校验两个版本：frontmatter、文件引用、英文版不含中文、脚本逐字节一致。
 - 代码改动在 `skills/en/.../scripts` 里做，然后运行 `python tools/build.py sync`。
 - `python tools/build.py package` 把两个 `.skill` 文件写到 `dist/`。
 - 推送 `v*` 标签会把它们附加到 GitHub release。
-- 改动流水线后，重跑六个种子的自测（CI 也会跑）。
+- 改动流水线后，重跑六个种子的自测和 `python -m unittest discover -s tests`（CI 两者都会跑）。
 
 ## 致谢与来源
 

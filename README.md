@@ -177,8 +177,9 @@ Other modes:
 
 Most masking does not work. A high-pass filter, music over the top, or a phone-call codec all leave the narrow
 tones recoverable. What works is removing the information: cut the fly-over out, change the time between two
-fly-overs, or replace the audio track. Run `afg_cli.py audit my.mp4 --out work/audit` before posting. The
-skill's [countermeasures reference](skills/en/audio-flyover-geolocation/references/countermeasures.md)
+fly-overs, or replace the audio track. Run `afg_cli.py audit my.mp4 --out work/audit` before posting. A risk of
+`undetermined` means the automatic check could not decide (for example a clip shorter than 12 s); it is not a
+pass. The skill's [countermeasures reference](skills/en/audio-flyover-geolocation/references/countermeasures.md)
 explains why each measure works or fails.
 
 ## Limitations
@@ -197,6 +198,9 @@ explains why each measure works or fails.
   The pipeline reports each of these, but cannot remove them.
 - **Footage.** Editing that changes the time between events breaks the two-event method; a speed change
   rescales everything.
+- **Short clips.** A clip under about 2 minutes has too few windows for a background of its own, so `detect`
+  compares it with a calibrated noise model and reports `status: limited`. A clip shorter than `--min-dur`
+  (15 s; 12 s in `audit`) cannot produce an event and is reported as `insufficient`, never as "nothing found".
 
 ## Responsible use
 
@@ -223,6 +227,7 @@ skills/
 tools/build.py                       check | sync | package
 tools/make_figures.py                redraws docs/images from a pipeline run
 examples/synthetic_demo.sh           end-to-end CLI run on synthetic data
+tests/test_detection.py              detection and audit regression tests (synthetic)
 ```
 
 - `python tools/build.py check` validates both editions: frontmatter, file references, no Chinese text in the
@@ -230,7 +235,8 @@ examples/synthetic_demo.sh           end-to-end CLI run on synthetic data
 - Make code changes in `skills/en/.../scripts`, then run `python tools/build.py sync`.
 - `python tools/build.py package` writes both `.skill` files to `dist/`.
 - Pushing a `v*` tag attaches them to a GitHub release.
-- After changing the pipeline, rerun the six-seed self-test (CI does this too).
+- After changing the pipeline, rerun the six-seed self-test and `python -m unittest discover -s tests`
+  (CI runs both).
 
 ## Credits and sources
 

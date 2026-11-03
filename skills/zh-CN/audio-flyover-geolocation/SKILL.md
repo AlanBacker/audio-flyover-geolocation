@@ -82,12 +82,13 @@ CTF/教学/科研；有合法授权的调查（如执法协助、经当事人同
 ### 3.2 频谱 → 检测 → 追踪 → 拟合
 ```bash
 $AFG spectrogram input.mp4 --out work/rec            # 白化窄带频谱 + work/rec.png
-$AFG detect work/rec.spec.npz --out work/boxes.json  # 候选飞越框 (t0,t1,fmin,fmax,score_z)
+$AFG detect work/rec.spec.npz --out work/boxes.json  # 候选飞越框 (t0,t1,fmin,fmax,score_z) + boxes.diag.json
 $AFG plot work/rec.spec.npz --t0 160 --t1 320 --fmin 60 --fmax 380 --out work/zoom1.png
 $AFG trace work/rec.spec.npz --t0 166 --t1 315 --fmin 98 --fmax 364 --out work/e1.csv
 $AFG fit work/e1.csv --temp-c 18 --out work/e1.json  # v, d, tCPA, f0, 搜索窗口；附 e1.fit.png 叠加图
 ```
 要点：
+- 只有 `boxes.diag.json` 显示 `status: ok` 时，`boxes.json` 为空才表示"没有飞越"。`limited`（短片段改用校准噪声模型判定，或大部分音频被门控）和 `insufficient`（片段短于 `--min-dur`，或几乎全被门控）会附带 `reasons`：先读原因、看 `rec.png`，短片段可调低 `--min-dur`。
 - `--win`：近距离陡峭曲线用 0.5–1 s，远/弱曲线用 2–4 s。曲线弱时先 `plot` 放大肉眼确认，再给 `trace` 一个**只含一条谐波**的窄框，必要时用 `--anchors "t:f,t:f,..."` 手工给几个点。
 - 看 `fit` 输出的 `implausible`（非空 = 追踪跑到噪声或跳谐波上，**不要**进入搜索，脚本也会拒绝）和 `notes`（左右残差不对称 = 转弯/变速；近/远速度差 = 爬升或加速）。
 - 已知气温就给 `--temp-c`（c = 20.05·√(T+273.15)）；v、d 都与 c 成正比，不知道温度时保留默认 ±4 %。
@@ -156,6 +157,7 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 | 现象 | 原因 | 对策 |
 |---|---|---|
 | fit 给出 v≈280 m/s 或 d=60 km | 追踪跑到噪声/谐波之间跳 | 缩小到单谐波框；`--anchors`；`plot` 看清后再追 |
+| 短片段里 `detect` 什么都没找到 | `status` 为 `insufficient`（片段短于 `--min-dur`）或曲线太弱 | 看 `boxes.diag.json`；调低 `--min-dur`；看 `rec.png` 并用 `--anchors` 手工追踪 |
 | 漏斗为空 | 窗口过窄 / 高度基准错 / ADS-B 缺失 / 时间窗不对 | 先放宽 `--v-margin/--k-margin/--c-uncert`；检查 QNH、`--start/--end`；确认机型类别 `--event-classes` |
 | 得分接近的大量候选 | 单事件无时钟、航迹近平行、曲线太短 | 加第二事件、确定时钟、报告条带 |
 | 最佳点 rec_start 与元数据差几十秒 | 元数据时间是导出/上传时间 | 以声学结果为准，并在报告中说明 |
@@ -166,7 +168,8 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 ```bash
 $AFG audit my_video.mp4 --out work/audit
 ```
-输出候选飞越与风险等级。有效对策：**剪掉**至少一个飞越或破坏两次飞越之间的时间间隔；替换/去除原声轨（重新配音）；
+输出候选飞越、检测状态与风险等级。`undetermined` 表示自动检查无法判断（例如片段短于 12 s，或音调脊线太短无法评估），
+**不代表通过**；即使是 `low`，也只覆盖本检测器能看到的持续飞机音调，务必看 PNG。有效对策：**剪掉**至少一个飞越或破坏两次飞越之间的时间间隔；替换/去除原声轨（重新配音）；
 同时清理 GPS/EXIF/QuickTime 元数据和画面线索。**无效**：高通滤波（与人声频段重叠，残留仍可恢复）、
 "盖过去"（窄带音调在频谱里仍突出）、通话降噪（只在静音时门控）。详见 `references/countermeasures.md`。
 

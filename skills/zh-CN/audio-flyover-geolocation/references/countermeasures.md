@@ -19,6 +19,8 @@
 2. 同时检查：EXIF/GPS/QuickTime `©xyz` 位置标签、创建时间；画面中的路牌、地平线、太阳阴影、反光；
    其他环境声（钟声、广播、火车）；ENF（电网频率）也可用于时间取证。
 3. 若 risk 为 medium/high：剪掉飞越段或替换声轨后重新 audit。
+4. 若 risk 为 `undetermined` 或 `low, limited check`：自动检查并未放行该文件，请阅读 `detection.reasons`
+   并以 PNG 为准。
 
 ## 解释给用户的要点
 

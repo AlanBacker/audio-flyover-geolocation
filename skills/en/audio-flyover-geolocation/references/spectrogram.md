@@ -25,9 +25,26 @@ i.e. win ≲ 1/√|slope|. Example: a CPA slope of 2 Hz/s → win ≲ 0.7 s.
 
 ## 3. Detection (`detect`)
 
-- In sliding 60 s windows, a Viterbi search finds monotone descending paths, stacking 3 harmonics.
-- A window counts when its mean path strength exceeds the whole-recording median by the threshold (`--thr` dB,
-  default 0.8). Windows lasting ≥ `--min-dur` are merged into event boxes.
+- In sliding 60 s windows (`--window`, `--step`; the last window is aligned with the end, so the tail is always
+  examined), a Viterbi search finds the strongest monotone descending path.
+- By default it follows the brightest single line, whichever harmonic that is (`--harmonics 1`). All candidates
+  in a band share one harmonic count, the largest K with K × fmax under the spectrogram top, so 40–400 Hz under
+  a 600 Hz spectrogram stacks only one anyway. Per-candidate counts were tried and dropped: rows stacked over
+  different counts have different noise spread, and both detection and the self-test traces got worse.
+  `boxes.diag.json` and `trace` report the count actually used. Stacking pays off in a narrow `trace` box.
+- Each window's mean path strength is judged against a baseline (`boxes.diag.json` says which):
+  - **relative** (normal case): the recording's own window median, by `--thr` dB (default 0.8) and by 3.5 robust
+    standard deviations. Needs at least 6 usable windows, most of them background.
+  - **noise-model** (clips shorter than about 2 min, or tonal content through most of the recording): the same
+    pipeline run on synthetic Gaussian noise for the same window length, by `--null-db` (default 0.8). Whitening
+    makes that level independent of the noise's loudness and colour. It matched the background windows of all
+    six self-test recordings within ±0.06 dB. In 73 synthetic noise-only clips (12–300 s, with hum and speech
+    bursts) there were no false events, and passes within 1.5 km exceeded it by 1.5–12 dB. Real wind and traffic
+    noise were not part of that test.
+- Windows lasting ≥ `--min-dur` are merged into event boxes; shorter hits are listed as `short_hits`.
+- `status` in `boxes.diag.json`: `ok` = an empty result means no fly-over the detector can see; `limited` = the
+  noise model was used, or most frames are gated; `insufficient` = the check could not run as configured (clip
+  shorter than `--min-dur`, or almost everything gated), so an empty result says nothing.
 - Sorting the output by `score_z` (a robust z-score of relative strength) is more meaningful than by time.
 - **Detection is only a suggestion**: always confirm with `plot` and adjust the boxes yourself.
 

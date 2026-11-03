@@ -97,12 +97,16 @@ Check the environment first: `pip install numpy scipy matplotlib` (the DEM needs
 ### 3.2 Spectrogram → detect → trace → fit
 ```bash
 $AFG spectrogram input.mp4 --out work/rec            # whitened narrow-band spectrogram + work/rec.png
-$AFG detect work/rec.spec.npz --out work/boxes.json  # candidate fly-over boxes (t0, t1, fmin, fmax, score_z)
+$AFG detect work/rec.spec.npz --out work/boxes.json  # candidate boxes (t0, t1, fmin, fmax, score_z) + boxes.diag.json
 $AFG plot work/rec.spec.npz --t0 160 --t1 320 --fmin 60 --fmax 380 --out work/zoom1.png
 $AFG trace work/rec.spec.npz --t0 166 --t1 315 --fmin 98 --fmax 364 --out work/e1.csv
 $AFG fit work/e1.csv --temp-c 18 --out work/e1.json  # v, d, tCPA, f0, search windows; overlay in e1.fit.png
 ```
 Key points:
+- An empty `boxes.json` means "no fly-over" only when `boxes.diag.json` says `status: ok`. `limited` (short
+  clip judged against the calibrated noise model, or mostly gated audio) and `insufficient` (clip shorter than
+  `--min-dur`, or almost everything gated) come with `reasons`: read them, inspect `rec.png`, and lower
+  `--min-dur` for short clips.
 - `--win`: use 0.5–1 s for close, steep curves and 2–4 s for distant or faint ones. For a faint curve, zoom in
   with `plot` and confirm it by eye first. Then give `trace` a narrow box containing **only one harmonic**, and
   if needed add a few manual points with `--anchors "t:f,t:f,..."`.
@@ -234,6 +238,7 @@ explicitly that the result is "ambiguous".
 | Symptom | Cause | Fix |
 |---|---|---|
 | fit gives v≈280 m/s or d=60 km | The trace ran onto noise or jumped between harmonics | Narrow to a single-harmonic box; use `--anchors`; inspect with `plot` before tracing |
+| `detect` finds nothing in a short clip | `status` is `insufficient` (clip shorter than `--min-dur`) or the curve is weak | Read `boxes.diag.json`; lower `--min-dur`; look at `rec.png` and trace by hand with `--anchors` |
 | Empty funnel | Windows too narrow / wrong altitude datum / missing ADS-B / wrong time window | First widen `--v-margin/--k-margin/--c-uncert`; check QNH and `--start/--end`; check `--event-classes` |
 | Many candidates with similar scores | One event with no clock, near-parallel tracks, or a curve that is too short | Add a second event, pin down the clock, report a strip |
 | Best point's rec_start differs from metadata by tens of seconds | The metadata is the export/upload time | Trust the acoustic result and explain it in the report |
@@ -244,7 +249,9 @@ explicitly that the result is "ambiguous".
 ```bash
 $AFG audit my_video.mp4 --out work/audit
 ```
-This outputs candidate fly-overs and a risk level.
+This outputs candidate fly-overs, the detection status and a risk level. `undetermined` means the automatic
+check could not decide (for example a clip shorter than 12 s, or a tonal ridge too short to judge); it is not a
+pass. Even `low` only covers sustained aircraft tones this detector can see, so always look at the PNG.
 
 **What works**:
 - **Cut** at least one fly-over, or break the time gap between two fly-overs.

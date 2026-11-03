@@ -176,9 +176,25 @@ def sample_spec(spec, t, f, clip_db=(0.0, 30.0)):
     return v.reshape(shp)
 
 
-def harmonic_sum(spec, fmin, fmax, n_harm=4, t0=None, t1=None, df=None):
+def harmonics_used(spec, fmax, n_harm):
+    """Number of harmonics harmonic_sum() stacks for a band whose top candidate
+    is fmax: the largest K <= n_harm with K * fmax inside the spectrogram, and
+    never fewer than 1 (the fundamental itself)."""
+    return max(1, min(int(n_harm), int(np.floor(spec["f"][-1] / fmax + 1e-9))))
+
+
+def harmonic_sum(spec, fmin, fmax, n_harm=4, t0=None, t1=None, df=None, return_counts=False):
     """H(t, f) = mean_k max(W(t, k f), 0) for fundamental candidates f in [fmin, fmax].
-    Stacking harmonics raises SNR by ~10log10(K) dB for propeller tones."""
+    Stacking harmonics raises SNR by ~10log10(K) dB for propeller tones.
+
+    Every candidate gets the same K = harmonics_used(spec, fmax, n_harm), so a
+    wide band gets fewer harmonics than requested (40-400 Hz under a 600 Hz
+    spectrogram: K = 1). Per-candidate counts were tried and rejected: rows
+    stacked over different K have different noise spread, the ridge search then
+    favours the rows with fewer harmonics, and both detection z-scores and the
+    self-test traces got worse. To stack K harmonics keep fmax <= f_top / K
+    (narrow trace boxes do) or raise the spectrogram --fmax.
+    return_counts=True also returns K, so callers can report it."""
     t = spec["t"]
     sel = np.ones(t.size, bool)
     if t0 is not None:
@@ -190,13 +206,10 @@ def harmonic_sum(spec, fmin, fmax, n_harm=4, t0=None, t1=None, df=None):
     fg = np.arange(fmin, fmax + step / 2, step)
     acc = np.zeros((fg.size, tt.size), np.float32)
     T, F = np.meshgrid(tt, fg)
-    nk = 0
-    for k in range(1, n_harm + 1):
-        if k * fmax > spec["f"][-1]:
-            break
+    K = harmonics_used(spec, fmax, n_harm)
+    for k in range(1, K + 1):
         acc += sample_spec(spec, T, k * F, clip_db=(0.0, 40.0))
-        nk += 1
-    return fg, tt, acc / max(nk, 1)
+    return (fg, tt, acc / K, K) if return_counts else (fg, tt, acc / K)
 
 
 # ----------------------------------------------------------------------------
@@ -316,17 +329,57 @@ def _trace_pass(spec, t0, t1, fmin, fmax, n_harm, max_jump_hz, penalty, monotone
     return tt[ok], f_tr[ok], snr[ok], tt, fg, H
 
 
-def detect_events(spec, fmin=40.0, fmax=400.0, n_harm=3, thr_db=0.8, min_dur_s=15.0,
-                  merge_gap_s=10.0, win_s=60.0, step_s=10.0, k_mad=3.5):
+def noise_ridge_level(spec, fmin, fmax, n_harm, n_frames, n_draw=4, seed=0):
+    """Mean ridge level of pure noise put through the same pipeline (STFT,
+    whitening, harmonic sum, monotone ridge) over n_frames frames. Whitening
+    subtracts per-bin and per-frame medians in dB, which makes the level of
+    stationary Gaussian noise independent of its loudness and colour, so this
+    is a calibrated 'no tone here' reference that a clip too short to have a
+    background of its own can still be compared with. Returns (mean, sd)."""
+    fs, win_s, hop_s = int(spec["fs"]), float(spec["win_s"]), float(spec["hop_s"])
+    df = spec["f"][1] - spec["f"][0]
+    n = int(round(win_s * fs)) + (int(n_frames) - 1) * max(1, int(round(hop_s * fs)))
+    rng = np.random.default_rng(seed)
+    lv = []
+    for _ in range(n_draw):
+        noise = compute_spectrogram(rng.normal(size=n), fs, win_s, hop_s, spec["f"][0] + 2.0, spec["f"][-1] - df,
+                                    gate=False)
+        fg, _, H = harmonic_sum(noise, fmin, fmax, n_harm=n_harm, df=max(df, 0.5))
+        mj = max(1, int(np.ceil(10.0 * hop_s / (fg[1] - fg[0]))))
+        p = track_ridge(H, max_jump=mj, penalty=0.3, monotone=True)
+        lv.append(float(H[p, np.arange(H.shape[1])].mean()))
+    return float(np.mean(lv)), float(np.std(lv))
+
+
+def detect_events(spec, fmin=40.0, fmax=400.0, n_harm=1, thr_db=0.8, min_dur_s=15.0,
+                  merge_gap_s=10.0, win_s=60.0, step_s=10.0, k_mad=3.5, null_db=0.8, min_windows=6,
+                  return_info=False):
     """Find time spans containing a sustained, smoothly varying narrow-band
     tone (candidate fly-bys). Slides a window over the harmonic-summed
-    spectrogram, finds the optimal monotone ridge in each window and flags
-    windows whose mean ridge level stands out from the recording's own
-    distribution (noise ridges also pick maxima, so the comparison is relative).
+    spectrogram and finds the optimal monotone ridge in each window. Noise
+    ridges also pick maxima, so a window's ridge level is judged against a
+    baseline:
+
+    relative - the recording's own window distribution: median +
+        max(thr_db, k_mad * MAD). Needs >= min_windows usable windows, most of
+        them background.
+    noise-model - noise_ridge_level() for the same window length, by more than
+        null_db. Used when there are too few windows for a median (short clips)
+        or when the median window already sits null_db above the noise model
+        (tonal content through most of the recording).
+
+    n_harm defaults to 1, i.e. follow the brightest single line, whichever
+    harmonic it is: over 40-400 Hz under a 600 Hz spectrogram only one harmonic
+    fits for every candidate anyway (see harmonic_sum), and info['harmonics']
+    reports what was used. Stacking pays off inside a narrow trace box.
+
     Returns list of dicts: t0, t1, fmin, fmax (padded box), peak_snr_db (ridge
-    excess over median, dB), score_z."""
+    excess over the baseline, dB), score_z, basis, noise_excess_db.
+    return_info=True returns (events, info): info['status'] is 'ok',
+    'limited' or 'insufficient' with info['reasons']; an empty list means
+    "no fly-over found" only when the status is 'ok'."""
     df = spec["f"][1] - spec["f"][0]
-    fg, tt, H = harmonic_sum(spec, fmin, fmax, n_harm=n_harm, df=max(df, 0.5))
+    fg, tt, H, K = harmonic_sum(spec, fmin, fmax, n_harm=n_harm, df=max(df, 0.5), return_counts=True)
     hop = tt[1] - tt[0]
     dfg = fg[1] - fg[0]
     gated = np.asarray(spec.get("gated", np.zeros(spec["t"].size, bool)), bool)
@@ -334,20 +387,71 @@ def detect_events(spec, fmin=40.0, fmax=400.0, n_harm=3, thr_db=0.8, min_dur_s=1
     nw = max(5, int(round(win_s / hop)))
     ns = max(1, int(round(step_s / hop)))
     mj = max(1, int(np.ceil(10.0 * hop / dfg)))
-    spans, scores, paths = [], [], []
-    for s in range(0, max(1, H.shape[1] - nw + 1), ns):
+    info = {"status": "ok", "reasons": [], "baseline": None, "frames": int(tt.size),
+            "span_s": float(tt[-1] - tt[0]), "gated_fraction": float(gated.mean()),
+            "win_s": float(min(nw, tt.size) * hop), "step_s": float(ns * hop),
+            "harmonics": {"requested": int(n_harm), "used": int(K)}, "short_hits": []}
+    if K < n_harm:
+        info["harmonics"]["note"] = (f"only {K} of {n_harm} harmonics fit under the spectrogram top "
+                                     f"({spec['f'][-1]:.0f} Hz) for --fmax {fmax:g}; lower --fmax to "
+                                     f"{spec['f'][-1] / n_harm:.0f} Hz or raise the spectrogram --fmax to stack more")
+    if fmax > spec["f"][-1]:
+        info["harmonics"]["note"] = f"--fmax {fmax:g} Hz is above the spectrogram top ({spec['f'][-1]:.0f} Hz)"
+
+    def flag(status, reason):
+        rank = {"ok": 0, "limited": 1, "insufficient": 2}
+        if rank[status] > rank[info["status"]]:
+            info["status"] = status
+        info["reasons"].append(reason)
+
+    def done(ev):
+        return (ev, info) if return_info else ev
+
+    if info["span_s"] < min_dur_s:
+        flag("insufficient", f"the spectrogram spans {info['span_s']:.1f} s, shorter than min_dur_s={min_dur_s:g} s, "
+                             f"so no event can qualify; lower --min-dur (a short arc mainly constrains k = v^2/d)")
+    if info["gated_fraction"] > 0.5:
+        flag("limited", f"{100 * info['gated_fraction']:.0f} % of frames are gated (speech/transients)")
+    starts = list(range(0, max(1, H.shape[1] - nw + 1), ns))
+    if H.shape[1] > nw and starts[-1] < H.shape[1] - nw:
+        starts.append(H.shape[1] - nw)           # last window flush with the end: the tail is never skipped
+    spans, scores = [], []
+    for s in starts:
         sub = H[:, s:s + nw]
         p = track_ridge(sub, max_jump=mj, penalty=0.3, monotone=True)
         ok = ~gated[s:s + sub.shape[1]]          # gated (speech) frames carry no information
         vals = sub[p, np.arange(sub.shape[1])]
         spans.append((s, s + sub.shape[1]))
         scores.append(float(vals[ok].mean()) if ok.sum() > 0.3 * ok.size else np.nan)
-        paths.append(fg[p][ok] if ok.any() else fg[p])
     scores = np.asarray(scores)
-    scores = np.where(np.isfinite(scores), scores, np.nanmedian(scores))
-    base = np.median(scores)
-    mad = 1.4826 * np.median(np.abs(scores - base)) + 1e-6
-    hit = scores > base + max(thr_db, k_mad * mad)
+    valid = np.isfinite(scores)
+    info["n_windows"], info["n_valid_windows"] = len(spans), int(valid.sum())
+    if not valid.any():
+        flag("insufficient", "no window has enough ungated audio (more than 70 % speech/transients everywhere)")
+        return done([])
+    nm, nsd = noise_ridge_level(spec, fmin, fmax, n_harm, min(nw, tt.size))
+    excess = np.where(valid, scores - nm, -np.inf)
+    info["noise_model_db"] = nm
+    info["median_noise_excess_db"] = float(np.median(excess[valid]))
+    if valid.sum() >= min_windows and info["median_noise_excess_db"] <= null_db:
+        info["baseline"] = "relative"
+        sc = np.where(valid, scores, np.median(scores[valid]))
+        base = np.median(sc)
+        mad = 1.4826 * np.median(np.abs(sc - base)) + 1e-6
+        hit = sc > base + max(thr_db, k_mad * mad)
+        level, z = sc - base, (sc - base) / mad
+    else:
+        info["baseline"] = "noise-model"
+        if valid.sum() < min_windows:
+            flag("limited", f"only {int(valid.sum())} usable {info['win_s']:.0f} s window(s) (< {min_windows}): too "
+                            f"few for a background of the recording's own, so each window was compared with a "
+                            f"calibrated noise model instead")
+        else:
+            flag("limited", f"the median window already sits {info['median_noise_excess_db']:.1f} dB above the "
+                            f"noise model (tonal content through most of the recording), so the recording's own "
+                            f"median is not background; each window was compared with the noise model instead")
+        hit = valid & (excess > null_db)
+        level, z = excess, excess / max(nsd, 0.05)
     groups = []
     for i in np.flatnonzero(hit):
         if groups and (spans[i][0] - spans[groups[-1][-1]][1]) * hop <= merge_gap_s:
@@ -358,6 +462,7 @@ def detect_events(spec, fmin=40.0, fmax=400.0, n_harm=3, thr_db=0.8, min_dur_s=1
     for g in groups:
         a, b = spans[g[0]][0], spans[g[-1]][1] - 1
         if (b - a) * hop < min_dur_s:
+            info["short_hits"].append({"t0": float(tt[a]), "t1": float(tt[b]), "peak_snr_db": float(level[g].max())})
             continue
         # one continuous ridge over the whole span -> follows a single harmonic line
         sub = H[:, a:b + 1]
@@ -369,9 +474,13 @@ def detect_events(spec, fmin=40.0, fmax=400.0, n_harm=3, thr_db=0.8, min_dur_s=1
         pad_f = max(4.0, 0.06 * hi)
         out.append({"t0": float(max(tt[0], tt[a] - 15.0)), "t1": float(min(tt[-1], tt[b] + 15.0)),
                     "fmin": float(max(fmin, lo - pad_f)), "fmax": float(min(fmax, hi + pad_f)),
-                    "peak_snr_db": float(scores[g].max() - base), "score_z": float((scores[g].max() - base) / mad),
-                    "core_t0": float(tt[a]), "core_t1": float(tt[b])})
-    return out
+                    "peak_snr_db": float(level[g].max()), "score_z": float(z[g].max()),
+                    "core_t0": float(tt[a]), "core_t1": float(tt[b]),
+                    "basis": info["baseline"], "noise_excess_db": float(excess[g].max())})
+    if info["short_hits"] and not out:
+        flag(info["status"], f"{len(info['short_hits'])} tonal ridge(s) shorter than min_dur_s={min_dur_s:g} s were "
+                             f"found and dropped (see short_hits); inspect them with plot or lower --min-dur")
+    return done(out)
 
 
 # ----------------------------------------------------------------------------
