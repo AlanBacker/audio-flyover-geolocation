@@ -186,13 +186,17 @@ explains why each measure works or fails.
 
 - **Coverage.** It only works where the aircraft is in ADS-B data. Low-level GA outside rule airspace, military
   aircraft and privacy-addressed aircraft can be missing. No match in the data does not mean no match in
-  reality.
+  reality. When one of two aircraft is missing, the best score lands somewhere wrong. `score` checks every
+  answer against the traced curves and says `NO CONSISTENT SITE` when none fits, but it cannot tell a missing
+  aircraft from recordings made at different places.
 - **Datums.** Altitude datums matter at close range: pressure altitude needs a QNH correction, and GNSS
   altitude needs a geoid correction.
 - **Sound speed.** Its uncertainty scales v and d; strong wind skews the two sides of the curve.
 - **Geometry.**
   - A single straight pass has a mirror solution.
   - A single pass with a loose clock gives a strip, not a point.
+  - A single pass over a large area fits many aircraft about equally well (`DEGENERATE`); it needs a small
+    area as well as a clock.
   - Two nearly parallel tracks also give a strip.
 
   The pipeline reports each of these, but cannot remove them.

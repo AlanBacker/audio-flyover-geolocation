@@ -19,4 +19,4 @@ thunder  thunder-envelope geolocation (lightning data)
 simulate synthetic scenario generator used by the self-test
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"

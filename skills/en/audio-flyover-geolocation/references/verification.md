@@ -5,6 +5,8 @@ it with part C.
 
 ## A. Mandatory acoustic self-checks
 
+0. **Trace check**: `best.trace_check.consistent` must be true. With two events, `NO CONSISTENT SITE` means no
+   answer: report that, with the causes in section F, not the best-scoring point.
 1. **Overlay** (`result.rank1.<event>.png`): the cyan model curve should sit on the bright line in three places:
    - the approach asymptote;
    - the steep drop at CPA;
@@ -48,10 +50,10 @@ it with part C.
 
 | Grade | Conditions |
 |---|---|
-| **High** | All of: two events (crossing ≥ 25°), or one event + clock ±2 s and not mirrored; margin ≥ 0.15; overlay fits all three sections; heatmap radius ≤ 150 m; at least one independent corroboration |
+| **High** | All of: two events (crossing ≥ 25°), or one event + clock ±2 s and not mirrored; trace check passed; margin ≥ 0.15; overlay fits all three sections; heatmap radius ≤ 150 m; at least one independent corroboration |
 | **Medium** | Acoustic conditions met but no independent corroboration; or margin 0.05–0.15; or heatmap radius 150–600 m |
 | **Low** | Any of: mirror not ruled out; strip > 600 m; margin < 0.05; overlay fits only one section; ADS-B coverage doubtful |
-| **Unusable** | Fit implausible, empty funnel, or several aircraft with indistinguishable scores |
+| **Unusable** | Fit implausible, empty funnel, `NO CONSISTENT SITE`, `DEGENERATE`, or several aircraft with indistinguishable scores |
 
 How to write the location in the report:
 - High / medium: coordinates + "about ±R m (0.9 score region)".
@@ -84,6 +86,26 @@ Scenario:
 | One event, clock ±2 s, straight pass | 6–213 m (4/6); in the other 2/6 the mirror side scores slightly higher, and the truth is the flagged mirror alternative |
 | One event, clock ±30 s | 2–5 km strips, truth always inside the strip |
 
+In every seed the two-event answer passes the trace check (robust RMS 1.0–1.9 × the fit's own).
+
 This is idealised synthetic data (no ADS-B gaps, no wind, no multipath); expect larger errors on real footage.
 It shows **that the pipeline is correct and that its uncertainty reporting is honest**. It is not a real-world
 accuracy guarantee. After changing code, rerun `selftest --seed 7/11/23/42/101/2026`.
+
+## F. When no site is consistent
+
+Two events that no candidate explains together (`NO CONSISTENT SITE`, or only low scores whose overlays fit one
+event) leave several possibilities. The method cannot tell them apart; say so in the report.
+
+1. **The two events are not from one place**, or two recordings were joined with a wrong time offset. Check
+   that the recordings really share a spot and how their clocks relate.
+2. **An aircraft is missing from the ADS-B data**: no ADS-B Out (not required for much low-level GA in the US),
+   not received at low altitude or behind terrain, or excluded by `--event-classes`, `--start/--end` or the
+   bbox. Each event alone then still finds "matching" aircraft (any aircraft with a similar speed and distance
+   fits one curve), but no point explains both. Nothing in the audio can rule this out.
+3. **The site is outside the bbox or the time window.** Widen them.
+4. **A trace followed the wrong line** (another harmonic, music, a vehicle). Check every fit overlay.
+
+Next steps: run each event alone with a clock if one is known, and compare where the single-event strips lie.
+Strips that never meet point to cause 1 or 2. Look for another fly-over in the recording, or a visual clue that
+narrows the area.

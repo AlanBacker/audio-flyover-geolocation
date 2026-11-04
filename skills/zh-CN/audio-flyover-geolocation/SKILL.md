@@ -43,7 +43,7 @@ CTF/教学/科研；有合法授权的调查（如执法协助、经当事人同
 |---|---|---|
 | 频谱里有**清晰的单调下降窄带曲线**（螺旋桨 40–400 Hz 常见；直升机主旋翼 BPF 10–25 Hz、尾桨 50–120 Hz） | 至少 1 条；理想 2 条且时间间隔已知 | 没有曲线 → 本方法不适用（可考虑雷声法或视觉法） |
 | **日期** | 必须知道（或能限定到几天） | ADS-B 数据量无法承受 |
-| **区域** | 国家/州级即可；有城市级先验更快 | 全国搜索仍可行，但需要已知时间的单事件或双事件 |
+| **区域** | 两事件时国家/州级即可；有城市级先验更快 | 单事件需要准确的时钟**和**有限的区域：区域很大时，速度和距离相近的每架飞机都能差不多同样好地解释这条曲线（`score` 会给出 `DEGENERATE`）；自测区域为 50–70 km 见方 |
 | **录音时钟**（开始时刻） | 已知 ±2 s → 单事件可出点；±30 s → 单事件只能给出沿航迹的条带 | 需要两事件，用"时间差"代替绝对时间 |
 | **ADS-B 覆盖** | 目标飞机须有 ADS-B Out 且被地面站接收 | 美国 14 CFR 91.225：B/C 类空域及 Mode C veil 外、10,000 ft 以下的 GA 可不装 ADS-B Out → 可能根本不在数据里 |
 | 音频处理链 | 原始/轻压缩最好；手机通话编码通常保留该音调 | 严重降噪/剪辑会切断曲线，或破坏事件间的时间差 |
@@ -57,7 +57,8 @@ CTF/教学/科研；有合法授权的调查（如执法协助、经当事人同
 ├─ ≥2 条（同一段连续录音）→ 模式 A：两事件 + 未知绝对时间（视频主方法，最稳）
 │     两条航迹交叉角 < ~25° 时会退化成沿航迹条带（脚本会警告）
 ├─ 1 条
-│   ├─ 录音时间已知 ±几秒 → 模式 B：单事件 + 已知时间（视频后半段，US-wide 也能排第一）
+│   ├─ 录音时间已知 ±几秒 → 模式 B：单事件 + 已知时间（视频后半段，在那里 US-wide 也能排第一；
+│   │     空域繁忙时多架飞机可能同样吻合，需缩小区域）
 │   │     直线匀速飞过时左右镜像对称 → 必然有"镜像候选"，需第二线索（视觉/地形）判别
 │   └─ 时间只知 ±30 s 以上 → 模式 B'：只能给出长 ≈ 2·v·Δt 的条带；如实报告
 ├─ 没有飞机曲线但有雷声 + 已知日期 → 模式 T：雷声包络 × 闪电数据（km 级，见 references/thunder-method.md）
@@ -88,10 +89,14 @@ $AFG trace work/rec.spec.npz --t0 166 --t1 315 --fmin 98 --fmax 364 --out work/e
 $AFG fit work/e1.csv --temp-c 18 --out work/e1.json  # v, d, tCPA, f0, 搜索窗口；附 e1.fit.png 叠加图
 ```
 要点：
+- `boxes.json` 是事件列表（JSON 数组），检测状态在 `boxes.diag.json` 中；stdout 把两者合在一个对象里输出（`detection`、`events`、`events_file`）。
 - 只有 `boxes.diag.json` 显示 `status: ok` 时，`boxes.json` 为空才表示"没有飞越"。`limited`（短片段改用校准噪声模型判定，或大部分音频被门控）和 `insufficient`（片段短于 `--min-dur`，或几乎全被门控）会附带 `reasons`：先读原因、看 `rec.png`，短片段可调低 `--min-dur`。
 - 每个事件带 `trend`（`descending` 或 `flat`）和 `drop_pct`。频率上升的脊线不是飞越：它不进 `boxes.json`，而是列在 `boxes.diag.json` 的 `rejected` 中。事件带 `warnings` 表示其脊线做了单次飞越做不到的事（下降后又上升，或下降超过 45 %），多半连接了两架飞机或两条谐波：用 `plot` 查看，并给每一段单独的窄框再追踪。
 - `--win`：近距离陡峭曲线用 0.5–1 s，远/弱曲线用 2–4 s。曲线弱时先 `plot` 放大肉眼确认，再给 `trace` 一个**只含一条谐波**的窄框，必要时用 `--anchors "t:f,t:f,..."` 手工给几个点。
-- 看 `fit` 输出的 `implausible`（非空 = 追踪跑到噪声或跳谐波上，**不要**进入搜索，脚本也会拒绝）和 `notes`（左右残差不对称 = 转弯/变速；近/远速度差 = 爬升或加速）。
+- `trace` 输出 `box_coverage`，低于 50 % 时附带 `hint`。曲线先升后降（转弯或加速的飞机）时需要 `--no-monotone`。
+- 看 `fit` 输出的 `implausible`（非空 = 追踪跑到噪声、跳谐波或只留下一小段，**不要**进入搜索，脚本也会拒绝）和 `notes`（左右残差不对称 = 转弯/变速；近/远速度差 = 爬升或加速）。
+- `sigma` 已考虑残差相关（`resid_corr_time`、`sigma_inflation`、`n_eff`），但它只是统计误差：飞越过程中的变速会让 v、d 的偏差远大于 sigma。`corr_v_d` 接近 1 说明 v 和 d 沿 k = v²/d 相互滑动。所以搜索用宽速度窗和 k 窗。
+- `constraints.d_min/d_max` 是搜索用的距离窗，由速度窗和 k 窗推出；`d_fit_min/d_fit_max` 是拟合本身支持的范围（3 sigma）。两者相差很大时会有 note。
 - 已知气温就给 `--temp-c`（c = 20.05·√(T+273.15)）；v、d 都与 c 成正比，不知道温度时保留默认 ±4 %。
 - f0 只是"被追踪那条谐波"的静止频率，不必是基频；v、d 与谐波次数无关。BPF = 桨叶数 × RPM / 60 可用来**辅助**猜机型（C172 2 叶×2400 rpm ≈ 80 Hz；DHC-8-400 6 叶×1020 rpm ≈ 102 Hz），但不要用它硬过滤候选。
 
@@ -114,6 +119,8 @@ $AFG search --tracks work/tracks.npz --events work/e1.json work/e2.json \
 - 模式 B：加 `--rec-start <UTC> --rec-start-tol 2`（或 30）。
 - `--quiet "a-b,c-d"` 手动指定"确实什么也没听到"的录音区间（默认自动取事件以外的部分）；风噪/说话很多的录音就少给，**静默是信号，但错误的静默会杀死真值**。
 - 默认网格 200 m；候选太多时缩小 bbox 而不是放大网格。
+- 静默过滤在稀疏空域（夜间、偏远地区）作用很小：大多数候选附近本来就没有飞机经过。它的效力随交通量和录音长度增长。
+- 搜索统计（`cands.stats.json`）还给出：`crossing_angle_deg`（两事件；所有航迹对交叉角都 < 25° 时结果只能是条带）；`flight_pairs`（单事件时有多少架不同的飞机能解释它）；`ground_elev_m`（所用的地面高程范围；`--ground-elev` 是常数，起伏地形请用 `dem-fetch`：1.3 km 斜距下 300 m 的高程误差会让模型距离偏 ~75 m）。
 
 ### 3.5 打分与精化
 ```bash
@@ -122,10 +129,13 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 ```
 - 对每个候选用插值后的 ADS-B 位置/速度（gs/track/vrate，而非差分位置）按**发射时刻**精确生成模型曲线，与频谱比对；共享时间偏移 δ（锁定两事件的物理时间差），每事件 f0 在 ±0.6 % 内微调。
 - 每个保留节点做 3×3 收缩爬山（100 → 25 m）；按**航班对**分组，每对保留至多 3 个相距 > 500 m 的假设（镜像必须同时存活）。
-- 输出：`result.json`（best、`margin_vs_2nd`、`robust_z`、`ambiguous_alternatives`、`coarse_plateau`、`geometry`、`verdict`）、`result.rankN.*.png`（模型曲线叠加）、`result.heatmap.png/csv`（0.9 区域半径）、`result.plateau.csv`。
-- 已知录音时钟时加 `--rec-start ... --rec-start-tol 2`，打分阶段也会禁止超出时钟的时间偏移。
+- **追踪检验**：每个假设的模型曲线都与各 CPA ±60 s 内的追踪点比对（`trace_check`）。错误曲线下的亮纹理（说话、音乐、风）可以抬高亮度得分，却不能让模型重现追踪曲线。两事件时，未通过的假设排在所有通过者之后。
+- 输出：`result.json`（best、`n_consistent`、`margin_vs_2nd`、`robust_z`、`ambiguous_alternatives`、`coarse_plateau`、`geometry`、`scoring`（打分了多少候选、其余为何未打分）、`verdict`、`diagnosis`）、`result.rankN.*.png`（模型曲线叠加）、`result.heatmap.png/csv`（0.9 区域半径）、`result.plateau.csv`。
+- verdict 以下列关键词开头：`NO CONSISTENT SITE`（两事件，没有假设能同时重现两条追踪曲线；`diagnosis` 列出可能原因）、`STRIP ONLY`（航迹交叉角 < 25°）、`DEGENERATE`（单事件，另有三架或以上飞机得分在 2 % 以内）、`AMBIGUOUS` 或 `unique within scored set`。
+- 已知录音时钟时加 `--rec-start ...`，打分阶段也会禁止超出时钟的时间偏移；不给 `--rec-start-tol` 时沿用搜索的容差。时间偏移范围至少覆盖事件 1 的 CPA 时间容差 `t_tol`，与漏斗所用窗口一致。
 
 ### 3.6 验证（不可省略，见 `references/verification.md`）
+0. 追踪检验：`best.trace_check.consistent` 必须为 true。`NO CONSISTENT SITE` 表示没有答案，无论得分多高。
 1. 叠加图：模型曲线必须在**两侧渐近线和 CPA 段**都贴合观测，而不是只贴一段。
 2. 热图：0.9 区域半径就是要报告的误差；两事件看 `geometry.warning`（交叉角小），单事件看 `coarse_plateau.length_m`（> 600 m）→ 报条带。
 3. 镜像/备选：用视觉线索（地平线、建筑、植被、道路噪声、回声）、DEM 视域、太阳方位排除。
@@ -157,12 +167,16 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 
 | 现象 | 原因 | 对策 |
 |---|---|---|
-| fit 给出 v≈280 m/s 或 d=60 km | 追踪跑到噪声/谐波之间跳 | 缩小到单谐波框；`--anchors`；`plot` 看清后再追 |
+| fit 给出 v≈280 m/s 或 d=60 km | 追踪跑到噪声/谐波之间跳，或只留下一小段（`trace` 的 `hint`） | 缩小到单谐波框；`--anchors`；曲线先升后降时用 `--no-monotone`；`plot` 看清后再追 |
 | 短片段里 `detect` 什么都没找到 | `status` 为 `insufficient`（片段短于 `--min-dur`）或曲线太弱 | 看 `boxes.diag.json`；调低 `--min-dur`；看 `rec.png` 并用 `--anchors` 手工追踪 |
 | 事件带 `warnings`，或一个框跨了两条曲线 | 两架飞机同时可闻，或脊线在谐波之间跳 | `plot` 查看该框；每条曲线单独给框追踪；`detect --window 20 --step 5` 可分开更近的飞越 |
 | 图上可见的音调不在 `boxes.json` 里 | 其脊线上升，被列在 `boxes.diag.json` 的 `rejected` 中 | 直线飞越不会上升；若是转弯的飞机，用 `--no-monotone` 手工追踪，不作为主事件 |
 | 漏斗为空 | 窗口过窄 / 高度基准错 / ADS-B 缺失 / 时间窗不对 | 先放宽 `--v-margin/--k-margin/--c-uncert`；检查 QNH、`--start/--end`；确认机型类别 `--event-classes` |
-| 得分接近的大量候选 | 单事件无时钟、航迹近平行、曲线太短 | 加第二事件、确定时钟、报告条带 |
+| 得分接近的大量候选，`DEGENERATE` | 单事件区域太大或无时钟、航迹近平行、曲线太短 | 加第二事件、确定时钟、缩小区域、报告条带 |
+| `NO CONSISTENT SITE` | 没有候选的模型能同时重现两条追踪曲线：录音不在同一地点或文件间偏移错误、某架飞机不在 ADS-B 中、地点在 bbox 外、或追踪有误 | 读 `diagnosis`；逐个检查拟合叠加图；放宽 bbox 和时间窗；在报告中说明无法排除飞机缺失 |
+| `score` 说 "nothing scored"，或 `scoring.rejected_clock` > 0 | 打分的时钟容差比搜索的更严 | `score` 中不给 `--rec-start-tol`（沿用搜索的）或给相同的值 |
+| 真实速度远在拟合 `sigma` 之外 | 飞机在飞越中变速或改变爬升率；sigma 只是统计误差 | 属正常；搜索的速度窗和 k 窗已覆盖。可对比 `fit_split` |
+| verdict 说 f0 缩放到了边界 | 拟合的 f0 有偏，常因飞越中变速 | 用 `--f-rel 0.012` 重跑 `score`；不要因此丢弃答案 |
 | 最佳点 rec_start 与元数据差几十秒 | 元数据时间是导出/上传时间 | 以声学结果为准，并在报告中说明 |
 | 喷气机干扰 | 喷气机是宽带噪声 + 少量音调 | 默认只用 prop/rotor/unknown 类；喷气机仅参与静默判定 |
 

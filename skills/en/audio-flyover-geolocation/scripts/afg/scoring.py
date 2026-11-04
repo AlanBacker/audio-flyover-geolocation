@@ -15,13 +15,17 @@ spectrogram:
 Brightness score = mean of clipped whitened dB under the modelled curve
 (and selected harmonics) over a fixed window; 'trace' score = Gaussian
 closeness to hand/auto-traced points (better for very faint curves).
+
+Bright texture under a wrong curve (speech, music, wind) can lift a brightness
+score, so `trace_check` then tests whether each hypothesis' model curve
+actually reproduces the traced points.
 """
 import numpy as np
 
 from .audio import sample_spec
 from .common import log
 from .geo import geodetic_to_ecef, offset_latlon
-from .physics import doppler_from_track
+from .physics import doppler_from_track, doppler_linear
 
 
 class CurveModel:
@@ -73,13 +77,18 @@ def _trace_scores(trace, cur, off, f0, deltas, scales, sigma_hz):
     return g.mean(axis=2)
 
 
-def score_point(model, spec, events, obs, fids, t_cpas, cfg, traces=None):
+def score_point(model, spec, events, obs, fids, t_cpas, cfg, traces=None, why=None):
     """Score one observer point for one assignment of flights to events.
-    Returns dict (total, per-event scores, delta, scales, rec_start_utc) or None."""
+    Returns dict (total, per-event scores, delta, scales, rec_start_utc) or None.
+    why: optional dict; the reason for a None is counted in it ('no_track': too
+    little ADS-B around the CPA, 'clock': every time shift lies outside the
+    known recording clock)."""
     curves = []
     for fid, tc in zip(fids, t_cpas):
         cu = model.curve(int(fid), obs, float(tc), cfg["half_w"] + 20)
         if cu is None:
+            if why is not None:
+                why["no_track"] = why.get("no_track", 0) + 1
             return None
         curves.append(cu)
     off0 = curves[0]["t_cpa_rx"] - events[0]["t_rec"]  # rec -> utc offset anchoring event 1
@@ -98,6 +107,8 @@ def score_point(model, spec, events, obs, fids, t_cpas, cfg, traces=None):
         rs, tol = cfg["clock"]
         bad = np.abs(off0 + deltas - rs) > tol
         if bad.all():
+            if why is not None:
+                why["clock"] = why.get("clock", 0) + 1
             return None
         best_s = [np.where(bad, -np.inf, b) for b in best_s]
     if cfg.get("lock_mode", "joint") == "e1":
@@ -129,13 +140,28 @@ def subgrid(lat, lon, spacing, n):
     return la, lo
 
 
+def effective_delta_max(events, delta_max=4.0, cap=30.0):
+    """Time-shift range for scoring: at least event 1's CPA-time tolerance t_tol
+    (the funnel admits candidates that far off), in whole seconds, at most cap."""
+    t_tol = float(events[0].get("t_tol", 0.0)) if events else 0.0
+    return float(min(max(delta_max, np.ceil(t_tol - 1e-9)), max(cap, delta_max)))
+
+
 def score_candidates(cand, R, spec, events, dem, c=343.0, mic_height=2.0, top_pairs=40, nodes_per_pair=4,
                      sub_m=100.0, sub_n=1, traces=None, harmonics=(1, 2), lock_mode="joint", half_w=60.0,
-                     delta_max=4.0, f_rel=0.006, clock=None, min_step_m=25.0, max_iter=8):
+                     delta_max=4.0, f_rel=0.006, clock=None, min_step_m=25.0, max_iter=8, info=None):
     """clock=(rec_start_utc, tol_s) restricts the time shift to the known recording clock.
-    Each kept node is refined by a shrinking 3x3 hill-climb (sub_m -> min_step_m)."""
+    The time shift spans +-max(delta_max, event 1's t_tol), the same CPA-time
+    tolerance the funnel used.  Each kept node is refined by a shrinking 3x3
+    hill-climb (sub_m -> min_step_m).  info: optional dict filled with counts
+    (unique candidates, scored, and why the others were not)."""
     model = CurveModel(R, c)
     nev = len(events)
+    dm = effective_delta_max(events, delta_max)
+    if dm > delta_max:
+        log(f"scoring: time shift widened to +-{dm:.0f} s to cover event 1's CPA-time tolerance "
+            f"({events[0]['t_tol']:.1f} s)")
+    delta_max = dm
     coarse = make_cfg(False, half_w, delta_max, f_rel, harmonics, lock_mode)
     fine = make_cfg(True, half_w, delta_max, f_rel, harmonics, lock_mode)
     coarse["clock"] = fine["clock"] = clock
@@ -145,15 +171,27 @@ def score_candidates(cand, R, spec, events, dem, c=343.0, mic_height=2.0, top_pa
     cand = cand[np.sort(ui)]
     log(f"scoring: {len(cand)} unique candidates (coarse pass)")
     cs = np.full(len(cand), -np.inf)
+    why = {}
     for i, cd in enumerate(cand):
         obs = geodetic_to_ecef(cd["lat"], cd["lon"], cd["elev"] + mic_height)
         fids = [cd["fid1"]] + ([cd["fid2"]] if nev > 1 else [])
         tcs = [cd["t1_cpa"]] + ([cd["t2_cpa"]] if nev > 1 else [])
-        r = score_point(model, spec, events, obs, fids, tcs, coarse, traces)
+        r = score_point(model, spec, events, obs, fids, tcs, coarse, traces, why)
         if r is not None:
             cs[i] = r["total"]
         if i and i % 2000 == 0:
             log(f"  coarse {i}/{len(cand)}")
+    if info is not None:
+        info.update(unique_candidates=int(len(cand)), scored=int(np.isfinite(cs).sum()),
+                    rejected_clock=int(why.get("clock", 0)), no_track=int(why.get("no_track", 0)),
+                    delta_max_s=float(delta_max),
+                    clock=None if clock is None else {"rec_start": float(clock[0]), "tol_s": float(clock[1])})
+    if why.get("clock"):
+        log(f"scoring: {why['clock']} of {len(cand)} candidates dropped by the recording clock: their implied start "
+            f"is more than {clock[1]:.0f} s (+-{delta_max:.0f} s shift) from --rec-start - give score the same "
+            "--rec-start-tol as search, or widen it")
+    if why.get("no_track"):
+        log(f"scoring: {why['no_track']} candidates without enough ADS-B samples around the CPA")
     # keep the best node per flight pair plus spatially distinct runners-up
     # (a straight pass is mirror-symmetric about its track: both sides must survive)
     pair = cand["fid1"].astype(np.int64) * 10_000_000 + (cand["fid2"].astype(np.int64) + 1)
@@ -211,6 +249,75 @@ def score_candidates(cand, R, spec, events, dem, c=343.0, mic_height=2.0, top_pa
             hyps.append(rr[j])
     ranked = sorted(hyps, key=lambda r: -r["total"])
     return ranked, cand, cs
+
+
+def trace_check(R, hyps, events, traces, fits, c=343.0, mic_height=2.0, half_w=60.0, f_rel=0.006,
+                ratio_max=4.0, slack_hz=1.0):
+    """Does each hypothesis' model curve reproduce the traced points?  Adds
+    hyp["trace_check"] and hyp["scale_at_bound"] in place.
+
+    The model curve uses the hypothesis' own position, clock and f0 scale (as
+    scored).  It is compared with the event's traced points within +-half_w s of
+    the fitted CPA (the stretch the brightness score sees; the tracer's far
+    tails lean towards a straight pass when the aircraft turns), using the
+    points the event's linear fit kept as inliers.  Statistic: robust RMS, the
+    square root of the median squared residual.  The reference is the same
+    statistic for the linear fit; an event passes when
+        rms <= max(ratio_max * ref, ref + slack_hz).
+    On the synthetic self-tests the true answer stays within 1.6 x ref, while
+    wrong sites and wrong aircraft pairs exceed 15 x ref on at least one event.
+    One event alone is weaker: other aircraft with a similar speed and distance
+    reproduce the curve too."""
+    model = CurveModel(R, c)
+    nev = len(events)
+    for r in hyps:
+        fids = [r["fid1"]] + ([r["fid2"]] if nev > 1 else [])
+        tcs = [r["t1_cpa"]] + ([r["t2_cpa"]] if nev > 1 else [])
+        obs = geodetic_to_ecef(r["lat"], r["lon"], r["elev"] + mic_height)
+        per = []
+        for k, (fid, tc, ev) in enumerate(zip(fids, tcs, events)):
+            tr = traces[k] if traces is not None and k < len(traces) else None
+            ft = fits[k] if fits is not None and k < len(fits) else None
+            if tr is None or ft is None or len(tr[0]) < 10:
+                per.append(None)
+                continue
+            t, f = np.asarray(tr[0], float), np.asarray(tr[1], float)
+            res_l = doppler_linear(t, ft["f0"], ft["v"], ft["d"], ft["t_cpa_rx"], ft.get("c", c)) - f
+            mad = 1.4826 * np.median(np.abs(res_l - np.median(res_l))) + 1e-9
+            use = (np.abs(res_l) < 4 * mad) & (np.abs(t - ft["t_cpa_rx"]) <= half_w)
+            if use.sum() < 10:
+                per.append(None)
+                continue
+            ref = max(float(np.sqrt(np.median(res_l[use] ** 2))), 0.05)
+            cu = model.curve(int(fid), obs, float(tc), half_w + 60.0)
+            fm = np.full(t.size, np.nan)
+            if cu is not None:
+                fm = np.interp(t, cu["t_rx"] - r["rec_start_utc"], ev["f0"] * r["scales"][k] * cu["ratio"],
+                               left=np.nan, right=np.nan)
+            ok = use & np.isfinite(fm)
+            cover = float(ok.sum() / use.sum())
+            if ok.sum() < 10 or cover < 0.5:     # the model does not reach the traced CPA: wrong time or no track
+                per.append({"rms_hz": None, "ref_hz": ref, "ratio": None, "n": int(ok.sum()), "coverage": cover,
+                            "ok": False})
+                continue
+            rms = float(np.sqrt(np.median((fm[ok] - f[ok]) ** 2)))
+            per.append({"rms_hz": rms, "ref_hz": ref, "ratio": rms / ref, "n": int(ok.sum()), "coverage": cover,
+                        "ok": bool(rms <= max(ratio_max * ref, ref + slack_hz))})
+        known = [p["ok"] for p in per if p is not None]
+        r["trace_check"] = {"events": per, "consistent": (all(known) if known else None),
+                            "rule": f"robust rms <= max({ratio_max:g} x fit rms, fit rms + {slack_hz:g} Hz) "
+                                    f"within +-{half_w:g} s of CPA"}
+        r["scale_at_bound"] = [bool(abs(sc - 1.0) >= f_rel * (1 - 1e-6)) for sc in r["scales"]]
+    return hyps
+
+
+def rank_consistent(hyps, nev):
+    """Two events: hypotheses whose curves fail `trace_check` go below all the
+    others (score order is kept inside each group).  One event: unchanged - a
+    single curve is reproduced by too many wrong aircraft for the check to rank."""
+    if nev < 2:
+        return list(hyps)
+    return sorted(hyps, key=lambda r: ((r.get("trace_check") or {}).get("consistent") is False, -r["total"]))
 
 
 def pass_geometry(R, best, nev, min_cross_deg=25.0):
@@ -292,11 +399,13 @@ def ambiguity(ranked, frac=0.9, min_sep_m=500.0):
 
 
 def heatmap(R, spec, events, dem, best, c=343.0, mic_height=2.0, radius_m=1500.0, step_m=30.0, traces=None,
-            harmonics=(1, 2), lock_mode="joint", half_w=60.0, delta_max=4.0, f_rel=0.006):
-    """Dense local score map around the best candidate for its flight pair.
+            harmonics=(1, 2), lock_mode="joint", half_w=60.0, delta_max=4.0, f_rel=0.006, clock=None):
+    """Dense local score map around the best candidate for its flight pair, with
+    the same time-shift range and recording clock as `score_candidates`.
     Returns lat, lon grids and total / per-event score grids."""
     model = CurveModel(R, c)
-    cfg = make_cfg(True, half_w, delta_max, f_rel, harmonics, lock_mode)
+    cfg = make_cfg(True, half_w, effective_delta_max(events, delta_max), f_rel, harmonics, lock_mode)
+    cfg["clock"] = clock
     cfg["scales"] = 1 + np.linspace(-f_rel, f_rel, 13)
     n = int(round(radius_m / step_m))
     o = np.arange(-n, n + 1) * step_m

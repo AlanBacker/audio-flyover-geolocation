@@ -54,7 +54,7 @@ location to the report.
 |---|---|---|
 | A **clear monotonically descending narrow-band curve** in the spectrogram (propellers commonly 40–400 Hz; helicopter main-rotor BPF 10–25 Hz, tail rotor 50–120 Hz) | At least 1; ideally 2 with a known time gap | No curve → method not applicable (consider the thunder method or visual methods) |
 | **Date** | Must be known (or bounded to a few days) | ADS-B data volume becomes unmanageable |
-| **Region** | Country or state level is enough; a city-level prior is faster | Nationwide search still works, but needs one event with a known time or two events |
+| **Region** | Country or state level is enough for two events; a city-level prior is faster | One event alone needs a tight clock **and** a limited area: over a large area every aircraft with a matching speed and distance explains the curve about equally well (`score` says `DEGENERATE`); the self-test area is 50–70 km across |
 | **Recording clock** (start time) | Known to ±2 s → one event can give a point; ±30 s → one event gives only a strip along the track | Use two events; their time gap replaces absolute time |
 | **ADS-B coverage** | The target aircraft must have ADS-B Out and be received by ground stations | US 14 CFR 91.225: GA aircraft below 10,000 ft outside Class B/C airspace and the Mode C veil need not carry ADS-B Out → may be absent from the data |
 | Audio processing chain | Original or lightly compressed is best; phone-call codecs usually keep the tone | Heavy noise reduction or editing can cut the curve or destroy the gap between events |
@@ -68,7 +68,8 @@ How many usable curves?
 ├─ ≥2 (same continuous recording) → Mode A: two events, unknown absolute time (the video's main method; most robust)
 │     If the two tracks cross at < ~25°, the result degrades to a strip along the tracks (the script warns)
 ├─ 1
-│   ├─ Recording time known to a few seconds → Mode B: one event, known time (the video's second half; ranked first even US-wide)
+│   ├─ Recording time known to a few seconds → Mode B: one event, known time (the video's second half, ranked first
+│   │     US-wide there; in busier airspace many aircraft can fit equally, so restrict the area)
 │   │     A straight constant-speed pass is mirror-symmetric → there is always a "mirror candidate";
 │   │     a second clue (visual, terrain) is needed to pick between them
 │   └─ Time known only to ±30 s or worse → Mode B′: only a strip of length ≈ 2·v·Δt is possible; report it as such
@@ -103,6 +104,8 @@ $AFG trace work/rec.spec.npz --t0 166 --t1 315 --fmin 98 --fmax 364 --out work/e
 $AFG fit work/e1.csv --temp-c 18 --out work/e1.json  # v, d, tCPA, f0, search windows; overlay in e1.fit.png
 ```
 Key points:
+- `boxes.json` is the event list (a JSON array); the detection status is in `boxes.diag.json`. Stdout prints
+  both in one object (`detection`, `events`, `events_file`).
 - An empty `boxes.json` means "no fly-over" only when `boxes.diag.json` says `status: ok`. `limited` (short
   clip judged against the calibrated noise model, or mostly gated audio) and `insufficient` (clip shorter than
   `--min-dur`, or almost everything gated) come with `reasons`: read them, inspect `rec.png`, and lower
@@ -114,11 +117,18 @@ Key points:
 - `--win`: use 0.5–1 s for close, steep curves and 2–4 s for distant or faint ones. For a faint curve, zoom in
   with `plot` and confirm it by eye first. Then give `trace` a narrow box containing **only one harmonic**, and
   if needed add a few manual points with `--anchors "t:f,t:f,..."`.
+- `trace` reports `box_coverage`; below 50 % it adds a `hint`. A curve that rises before it falls (a turning or
+  accelerating aircraft) needs `--no-monotone`.
 - Check the `fit` output:
-  - `implausible` non-empty = the trace ran onto noise or jumped harmonics. **Do not** go on to the search (the
-    script refuses too).
+  - `implausible` non-empty = the trace ran onto noise, jumped harmonics or kept only a short piece. **Do not**
+    go on to the search (the script refuses too).
   - `notes`: left/right residual asymmetry = a turn or speed change; different approach/recede speeds = a climb
     or acceleration.
+  - `sigma` already allows for correlated residuals (`resid_corr_time`, `sigma_inflation`, `n_eff`), but it is
+    statistical only: a speed change during the pass biases v and d by more than sigma. `corr_v_d` near 1
+    means v and d trade off along k = v²/d. The search therefore uses wide speed windows and the k window.
+  - `constraints.d_min/d_max` is the search's distance window, which follows from the speed and k windows.
+    `d_fit_min/d_fit_max` is what the fit itself supports (3 sigma); a note says when the two differ a lot.
 - If you know the air temperature, pass `--temp-c` (c = 20.05·√(T+273.15)). v and d both scale with c; without
   a temperature, keep the default ±4 %.
 - f0 is just the rest frequency of whichever harmonic you traced, not necessarily the fundamental; v and d do
@@ -155,11 +165,18 @@ The funnel has three stages:
 3. **Silence filter**: in the remaining quiet spans, no other propeller or rotor aircraft may pass within
    `--d-quiet`.
 
+The search stats (`cands.stats.json`) also report:
+- `crossing_angle_deg` (two events): if every pair crosses at < 25°, the result can only be a strip;
+- `flight_pairs`: with one event, how many different aircraft can explain it;
+- `ground_elev_m`: the elevation range used. With `--ground-elev` it is a constant; in relief use `dem-fetch`
+  (300 m of elevation error at 1.3 km slant range shifts the modelled distance by ~75 m).
+
 Options:
 - Mode B: add `--rec-start <UTC> --rec-start-tol 2` (or 30).
 - `--quiet "a-b,c-d"` names recording spans where you are sure nothing was heard (default: everything outside
   the events). Give fewer spans when the recording has a lot of wind or speech. **Silence is signal, but false
-  silence kills the true answer.**
+  silence kills the true answer.** In sparse airspace (night, remote areas) it removes little: most candidates
+  had no aircraft nearby anyway. It only gains power with traffic and with recording length.
 - Default grid is 200 m. If there are too many candidates, shrink the bbox rather than enlarging the grid.
 
 ### 3.5 Scoring and refinement
@@ -174,16 +191,26 @@ $AFG score --tracks work/tracks.npz --spec work/rec.spec.npz --events work/e1.js
 - **Refinement**: every kept node gets a shrinking 3×3 hill-climb (100 → 25 m).
 - **Grouping**: results are grouped by **flight pair**. Each pair keeps up to 3 hypotheses more than 500 m
   apart, so both mirror sides survive.
+- **Trace check**: every hypothesis' model curve is compared with the traced points within ±60 s of each CPA
+  (`trace_check`). A bright texture under a wrong curve (speech, music, wind) can lift a brightness score;
+  it cannot make the model reproduce the trace. With two events, hypotheses that fail go below all others.
 - **Outputs**:
-  - `result.json`: best, `margin_vs_2nd`, `robust_z`, `ambiguous_alternatives`, `coarse_plateau`, `geometry`,
-    `verdict`.
+  - `result.json`: best, `n_consistent`, `margin_vs_2nd`, `robust_z`, `ambiguous_alternatives`,
+    `coarse_plateau`, `geometry`, `scoring` (how many candidates were scored and why others were not),
+    `verdict`, `diagnosis`.
+  - The verdict starts with `NO CONSISTENT SITE` (two events, nothing reproduces both traces; `diagnosis`
+    lists the likely causes), `STRIP ONLY` (tracks cross at < 25°), `DEGENERATE` (one event, three or more
+    other aircraft within 2 %), `AMBIGUOUS` or `unique within scored set`.
   - `result.rankN.*.png`: model-curve overlays.
   - `result.heatmap.png/csv`: radius of the 0.9 region.
   - `result.plateau.csv`.
-- With a known recording clock, add `--rec-start ... --rec-start-tol 2`. Scoring then also forbids time shifts
-  outside the clock.
+- With a known recording clock, add `--rec-start ...`. Scoring then also forbids time shifts outside the
+  clock; without `--rec-start-tol` it uses the search's tolerance. The time shift spans at least event 1's
+  CPA-time tolerance `t_tol`, the same window the funnel used.
 
 ### 3.6 Verification (not optional; see `references/verification.md`)
+0. **Trace check**: `best.trace_check.consistent` must be true. `NO CONSISTENT SITE` means there is no answer,
+   whatever the score.
 1. **Overlays**: the model curve must fit the observation on **both asymptotes and through the CPA**, not just
    one segment.
 2. **Heat map**: the 0.9-region radius is the error to report. Report a strip when either holds:
@@ -241,12 +268,16 @@ explicitly that the result is "ambiguous".
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| fit gives v≈280 m/s or d=60 km | The trace ran onto noise or jumped between harmonics | Narrow to a single-harmonic box; use `--anchors`; inspect with `plot` before tracing |
+| fit gives v≈280 m/s or d=60 km | The trace ran onto noise, jumped between harmonics, or kept only a short piece (`trace` `hint`) | Narrow to a single-harmonic box; use `--anchors`; `--no-monotone` if the curve rises before it falls; inspect with `plot` before tracing |
 | `detect` finds nothing in a short clip | `status` is `insufficient` (clip shorter than `--min-dur`) or the curve is weak | Read `boxes.diag.json`; lower `--min-dur`; look at `rec.png` and trace by hand with `--anchors` |
 | An event has `warnings`, or one box spans two curves | Two aircraft audible at the same time, or the ridge jumped between harmonics | `plot` the box; trace each curve in its own box; `detect --window 20 --step 5` separates closer passes |
 | A visible tone is missing from `boxes.json` | Its ridge rises, so it is listed under `rejected` in `boxes.diag.json` | A straight pass never rises; if it is a turning aircraft, trace it by hand with `--no-monotone`, not as a primary event |
 | Empty funnel | Windows too narrow / wrong altitude datum / missing ADS-B / wrong time window | First widen `--v-margin/--k-margin/--c-uncert`; check QNH and `--start/--end`; check `--event-classes` |
-| Many candidates with similar scores | One event with no clock, near-parallel tracks, or a curve that is too short | Add a second event, pin down the clock, report a strip |
+| Many candidates with similar scores, `DEGENERATE` | One event over a large area or with no clock, near-parallel tracks, or a curve that is too short | Add a second event, pin down the clock, shrink the area, report a strip |
+| `NO CONSISTENT SITE` | No candidate's model reproduces both traced curves: recordings from different places or a wrong offset between files, an aircraft missing from ADS-B, the site outside the bbox, or a bad trace | Read `diagnosis`; check each fit overlay; widen bbox and time window; say in the report that a missing aircraft cannot be ruled out |
+| `score` says "nothing scored", or `scoring.rejected_clock` > 0 | Score's clock tolerance is tighter than the search's | Leave out `--rec-start-tol` in `score` (it then uses the search's) or pass the same value |
+| The true speed lies far outside fit `sigma` | The aircraft changed speed or climb during the pass; sigma is statistical only | Expected; the search's speed and k windows cover it. Compare `fit_split` |
+| Verdict says the f0 scale sits at the limit | The fitted f0 is off, often from a speed change in the pass | Re-run `score` with `--f-rel 0.012`; do not treat it as a reason to drop the answer |
 | Best point's rec_start differs from metadata by tens of seconds | The metadata is the export/upload time | Trust the acoustic result and explain it in the report |
 | Jet interference | Jets are broadband noise plus a few tones | By default only prop/rotor/unknown classes are events; jets only count for the silence check |
 

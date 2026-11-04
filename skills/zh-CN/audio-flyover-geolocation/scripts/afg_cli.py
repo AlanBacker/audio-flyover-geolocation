@@ -71,7 +71,8 @@ def _trace_meta(path):
 
 
 def _load_events(paths):
-    evs, traces = [], []
+    """Search constraints, traced points and linear fit of each event JSON."""
+    evs, traces, fits = [], [], []
     for p in paths:
         e = load_json(p)
         if e.get("implausible"):
@@ -84,7 +85,13 @@ def _load_events(paths):
         evs.append(c)
         tp = e.get("trace_csv")
         traces.append(_read_trace(tp) if tp and os.path.exists(tp) else None)
-    return evs, traces
+        fits.append(e.get("fit"))
+    return evs, traces, fits
+
+
+def _search_stats(cands_path):
+    p = os.path.splitext(cands_path)[0] + ".stats.json"
+    return load_json(p) if os.path.exists(p) else {}
 
 
 # ----------------------------------------------------------------------------- commands
@@ -130,7 +137,8 @@ def cmd_detect(a):
     log(f"detection status: {info['status']} ({info['n_valid_windows']} usable windows, {info['baseline']} baseline)")
     for r in info["reasons"]:
         log("  -", r)
-    print(json.dumps({"detection": info, "diag": diag, "events": ev}, indent=2))
+    # --out holds the event list (a JSON array), <out>.diag.json the detection info; stdout shows both
+    print(json.dumps({"detection": info, "diag": diag, "events_file": a.out, "events": ev}, indent=2))
 
 
 def cmd_trace(a):
@@ -152,8 +160,17 @@ def cmd_trace(a):
     if k < a.harmonics:
         log(f"note: only {k} of {a.harmonics} harmonics fit under the spectrogram top ({spec['f'][-1]:.0f} Hz) "
             f"for --fmax {a.fmax:g}; a narrower box around one harmonic stacks more")
+    cover = float(t.max() - t.min()) / max(a.t1 - a.t0, 1e-9) if t.size else 0.0
+    hint = None
+    if cover < 0.5:
+        hint = (f"the trace covers only {cover:.0%} of the box: "
+                + ("if the curve rises before it falls (turning or accelerating aircraft), re-run with --no-monotone; "
+                   "otherwise " if not a.no_monotone else "")
+                + "narrow --fmin/--fmax around one harmonic or add --anchors")
+        log("note:", hint)
     print(json.dumps({"points": int(t.size), "csv": a.out, "png": png, "harmonics_used": k,
-                      "f_range": [float(f.min()), float(f.max())] if t.size else None}, indent=2))
+                      "f_range": [float(f.min()), float(f.max())] if t.size else None,
+                      "box_coverage": cover, "hint": hint}, indent=2))
 
 
 def cmd_fit(a):
@@ -184,6 +201,15 @@ def cmd_fit(a):
     if split and abs(split["v_out"] - split["v_in"]) > 0.08 * fit["v"]:
         out["notes"].append(f"approach/recede speeds differ ({split['v_in']:.0f} vs {split['v_out']:.0f} m/s): speed or "
                             "climb changed during the pass - v and d individually biased; k=v^2/d window still holds")
+    if fit["sigma_inflation"] > 1.2 * corr:
+        out["notes"].append(f"residuals stay correlated over {fit['resid_corr_time']:.0f} points (a turn, a speed or "
+                            f"power change, or a trace along a smooth wrong path): sigmas are widened "
+                            f"x{fit['sigma_inflation'] / corr:.1f} beyond the frame-overlap factor")
+    if cons["d_max"] > 3 * cons["d_fit_max"] or cons["d_min"] < cons["d_fit_min"] / 3:
+        out["notes"].append(f"search distance window {cons['d_min']:.0f}-{cons['d_max']:.0f} m follows from the speed "
+                            f"and k windows, not from the distance fit ({cons['d_fit_min']:.0f}-"
+                            f"{cons['d_fit_max']:.0f} m at 3 sigma), so the funnel restricts distance only loosely; "
+                            "if the aircraft flew steadily, a smaller --v-margin narrows it")
     if fit["d"] < 150:
         out["notes"].append("very small CPA distance: could be a ground vehicle/drone, not an aircraft")
     if fit["v"] < 25:
@@ -240,7 +266,7 @@ def _resampled(tracks, t0=None, t1=None, dt=1.0):
 
 def cmd_search(a):
     from afg.search import run_search
-    events, _ = _load_events(a.events)
+    events, _, _ = _load_events(a.events)
     rec_start = parse_time(a.rec_start) if a.rec_start else None
     t0 = parse_time(a.start) if a.start else None
     t1 = parse_time(a.end) if a.end else None
@@ -261,13 +287,14 @@ def cmd_search(a):
 
 
 def cmd_score(a):
-    from afg.scoring import ambiguity, heatmap, model_overlay, pass_geometry, score_candidates, score_region
-    events, traces = _load_events(a.events)
-    if not a.trace_mode:
-        traces = None
+    from afg.scoring import (ambiguity, heatmap, model_overlay, pass_geometry, rank_consistent,
+                             score_candidates, score_region, trace_check)
+    events, all_traces, fits = _load_events(a.events)
+    traces = all_traces if a.trace_mode else None
     cand = np.load(a.cands)
     if cand.size == 0:
         raise SystemExit("no candidates to score")
+    sstats = _search_stats(a.cands)
     tmin = np.nanmin(cand["t1_cpa"]) - 1800
     tmax = np.nanmax(np.r_[cand["t1_cpa"], np.nan_to_num(cand["t2_cpa"], nan=0)]) + 1800
     fl, R = _resampled(a.tracks, tmin, tmax, a.dt)
@@ -275,12 +302,34 @@ def cmd_score(a):
     dem = _dem(a)
     c = _c(a)
     harm = [float(h) for h in a.harmonics.split(",")]
-    clock = (parse_time(a.rec_start), a.rec_start_tol) if a.rec_start else None
+    clock = None
+    if a.rec_start:
+        tol = a.rec_start_tol
+        if tol is None:  # same tolerance as the search, so its candidates are not dropped here
+            tol = float((sstats.get("clock") or {}).get("rec_start_tol", 5.0))
+            log(f"score: clock tolerance {tol:g} s ({'as in the search' if sstats.get('clock') else 'default'})")
+        clock = (parse_time(a.rec_start), tol)
+    elif sstats.get("clock"):
+        log("note: the search used --rec-start; pass it to score as well to keep the time shift inside that clock")
+    info = {}
     ranked, ucand, cs = score_candidates(cand, R, spec, events, dem, c, a.mic_height, a.top_pairs, 4, a.sub_m, 1,
-                                         traces, harm, a.lock, a.half_window, a.delta_max, a.f_rel, clock)
+                                         traces, harm, a.lock, a.half_window, a.delta_max, a.f_rel, clock, info=info)
     if not ranked:
-        raise SystemExit("nothing scored")
-    amb = ambiguity(ranked, a.ambiguity_frac)
+        why = []
+        if info.get("rejected_clock"):
+            why.append(f"{info['rejected_clock']} lie outside the recording clock (score --rec-start-tol "
+                       f"{clock[1]:g} s, time shift +-{info['delta_max_s']:g} s); use the search's --rec-start-tol")
+        if info.get("no_track"):
+            why.append(f"{info['no_track']} have too few ADS-B samples around the CPA")
+        raise SystemExit(f"nothing scored out of {info.get('unique_candidates', len(cand))} candidates"
+                         + (": " + "; ".join(why) if why else ""))
+    nev = len(events)
+    trace_check(R, ranked, events, all_traces, fits, c, a.mic_height, a.half_window, a.f_rel)
+    ranked = rank_consistent(ranked, nev)
+    # alternatives and margins among the hypotheses that reproduce the traced curves (two events)
+    pool = [r for r in ranked if r["trace_check"]["consistent"] is not False] if nev > 1 else ranked
+    pool = pool or ranked
+    amb = ambiguity(pool, a.ambiguity_frac)
     plateau = score_region(ucand, cs, a.ambiguity_frac, ranked[0])
     with open(os.path.splitext(a.out)[0] + ".plateau.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
@@ -291,19 +340,19 @@ def cmd_score(a):
         r["flight2"] = fl.label(r["fid2"]) if r["fid2"] >= 0 else None
         r["rec_start_iso"] = iso(r["rec_start_utc"])
         r["maps"] = f"https://www.google.com/maps/search/?api=1&query={r['lat']:.6f},{r['lon']:.6f}"
-    tot = np.array([r["total"] for r in ranked])
-    summary = {"best": ranked[0], "n_hypotheses": len(ranked),
+    tot = np.array([r["total"] for r in pool])
+    best = ranked[0]
+    summary = {"best": best, "n_hypotheses": len(ranked),
+               "n_consistent": sum(r["trace_check"]["consistent"] is not False for r in ranked),
+               "distinct_aircraft": len({(r["fid1"], r["fid2"]) for r in ranked}),
                "margin_vs_2nd": float((tot[0] - tot[1]) / max(tot[0], 1e-9)) if tot.size > 1 else None,
                "robust_z": float((tot[0] - np.median(tot)) / (1.4826 * np.median(np.abs(tot - np.median(tot))) + 1e-9)) if tot.size > 3 else None,
                "ambiguous_alternatives": amb,
                "coarse_plateau": {k: v for k, v in plateau.items() if k not in ("lat", "lon")},
-               "geometry": pass_geometry(R, ranked[0], len(events)),
-               "verdict": ("AMBIGUOUS - resolve with another event/visual check" if amb else "unique within scored set")
-               + (f"; coarse plateau is {plateau['length_m']:.0f} m long - treat the answer as a strip, not a point"
-                  if len(events) == 1 and plateau["length_m"] > 600 else ""),
+               "geometry": pass_geometry(R, best, nev),
+               "scoring": info,
                "top": ranked[: a.report]}
-    if "warning" in summary["geometry"]:
-        summary["verdict"] += "; " + summary["geometry"]["warning"]
+    summary["verdict"], summary["diagnosis"] = _verdict(summary, ranked, nev, plateau, a.f_rel)
     base = os.path.splitext(a.out)[0]
     # overlays for top-3
     for k, r in enumerate(ranked[:3]):
@@ -317,7 +366,8 @@ def cmd_score(a):
                             overlays=[o], title=f"rank {k + 1} score={r['total']:.2f}  {e['name']}")
     if not a.no_heatmap:
         la, lo, tot_g, per_g, E, N = heatmap(R, spec, events, dem, ranked[0], c, a.mic_height, a.heat_radius,
-                                             a.heat_step, traces, harm, a.lock, a.half_window, a.delta_max, a.f_rel)
+                                             a.heat_step, traces, harm, a.lock, a.half_window, a.delta_max, a.f_rel,
+                                             clock)
         _plot_heat(base + ".heatmap.png", E, N, tot_g, per_g, ranked[0])
         k = np.nanargmax(tot_g)
         summary["heatmap_peak"] = {"lat": float(la.ravel()[k]), "lon": float(lo.ravel()[k]), "score": float(np.nanmax(tot_g))}
@@ -334,6 +384,51 @@ def cmd_score(a):
                            + [f"{per_g[j].ravel()[i]:.4f}" for j in range(per_g.shape[0])])
     dump_json(summary, a.out)
     print(json.dumps({k: summary[k] for k in summary if k != "top"}, indent=2, default=float))
+
+
+NO_SITE_CAUSES = [
+    "the two events were not recorded at the same place, or two recordings are joined with a wrong time offset",
+    "one of the aircraft is missing from the ADS-B data (no ADS-B Out, not received at low level, or excluded by "
+    "--event-classes, --start/--end or the bbox): the method cannot rule this out",
+    "the site lies outside --bbox, or the curves are not aircraft (music, a vehicle, a tone)",
+    "a trace followed the wrong line (check each fit overlay)",
+]
+
+
+def _verdict(summary, ranked, nev, plateau, f_rel):
+    """Verdict line plus, for a failed two-event search, the likely causes."""
+    best, geo, amb = ranked[0], summary["geometry"], summary["ambiguous_alternatives"]
+    consistent = best["trace_check"]["consistent"]
+    diagnosis = None
+    if nev > 1 and consistent is False:
+        head = ("NO CONSISTENT SITE: no hypothesis' model curves reproduce the traced curves (see best.trace_check); "
+                "the best score is not an answer")
+        diagnosis = NO_SITE_CAUSES
+    elif "warning" in geo:
+        head = "STRIP ONLY: " + geo["warning"]
+    else:
+        others = [r for r in ranked[1:] if r["total"] >= 0.98 * best["total"] and r["fid1"] != best["fid1"]]
+        if nev == 1 and len(others) >= 3:
+            head = (f"DEGENERATE: {len(others)} other aircraft score within 2 % of the best; one event cannot tell "
+                    "them apart - add a second event, a tighter clock or a smaller area")
+        elif amb:
+            head = "AMBIGUOUS - resolve with another event/visual check"
+        else:
+            head = "unique within scored set"
+    parts = [head]
+    if head.startswith("STRIP ONLY") and amb:
+        parts.append(f"{len(amb)} alternative(s) elsewhere (ambiguous_alternatives)")
+    if nev == 1 and plateau["length_m"] > 600:
+        parts.append(f"coarse plateau is {plateau['length_m']:.0f} m long - treat the answer as a strip, not a point")
+    if nev == 1 and consistent is False:
+        parts.append("the best hypothesis' model curve does not reproduce the traced curve (best.trace_check)")
+    if diagnosis and "warning" in geo:
+        parts.append(geo["warning"])
+    edge = [i + 1 for i, b in enumerate(best.get("scale_at_bound", [])) if b]
+    if edge:
+        parts.append(f"f0 scale for event {', '.join(map(str, edge))} sits at the +-{f_rel:g} limit: the fitted f0 "
+                     "is off (often a speed change during the pass); re-run score with a larger --f-rel")
+    return "; ".join(parts), diagnosis
 
 
 def _plot_heat(path, E, N, tot, per, best):
@@ -447,7 +542,7 @@ def cmd_simulate(a):
 
 def cmd_selftest(a):
     """End-to-end blind run on a synthetic scenario. Exit code 0 = pass."""
-    from afg.scoring import score_candidates
+    from afg.scoring import rank_consistent, score_candidates, trace_check
     from afg.search import run_search
     from afg.simulate import simulate
     from afg.tracks import Flights, Resampled
@@ -465,10 +560,12 @@ def cmd_selftest(a):
         log("FAIL: fewer than two fly-overs detected")
         return 1
     c = 343.0
-    events, rep = [], []
+    events, rep, traces, fits = [], [], [], []
     for k, b in enumerate(boxes):
         t, f, s = audio.trace_curve(spec, b["t0"], b["t1"], b["fmin"], b["fmax"], n_harm=3)
         fit = physics.fit_linear(t, f, c=c, corr_factor=np.sqrt(1.0 / 0.2))
+        traces.append((t, f))
+        fits.append(fit)
         cons = physics.search_constraints(fit, alt=physics.fit_split(t, f, fit, c=c, corr_factor=np.sqrt(1.0 / 0.2)))
         cons["half_span_s"] = float(max(fit["t_cpa_rx"] - t.min(), t.max() - fit["t_cpa_rx"]))
         cons["name"] = f"e{k + 1}"
@@ -509,7 +606,10 @@ def cmd_selftest(a):
     cand, stats = run_search(R, fl, events, dem, bbox, 200.0, c, rec_duration=truth["rec_duration_s"])
     log("funnel A:", json.dumps(stats, default=float))
     ranked, _, _ = score_candidates(cand, R, spec, events, dem, c) if cand.size else ([], None, None)
+    ranked = rank_consistent(trace_check(R, ranked, events, traces, fits, c), 2)
     results["two_event_unknown_time"] = dict(_judge(ranked, truth, fl), funnel=stats, **funnel_has_truth(cand, [0, 1]))
+    if ranked:
+        results["two_event_unknown_time"]["trace_check"] = ranked[0]["trace_check"]
     if ranked:
         # local confidence region (>= 0.9 x peak) of the fine score map: the honest
         # error bar.  Pass also when the truth lies inside a compact region.
@@ -549,6 +649,7 @@ def cmd_selftest(a):
             log(f"funnel B{k + 1} {tag}:", json.dumps(stats_b, default=float))
             ranked_b, uc, cs = (score_candidates(cand_b, R, spec, ev_b, dem, c, clock=(truth["rec_start_unix"], tol))
                                 if cand_b.size else ([], None, None))
+            trace_check(R, ranked_b, ev_b, [traces[k]], [fits[k]], c)
             res = dict(_judge(ranked_b, truth, fl, single=k), **funnel_has_truth(cand_b, [k]))
             if ranked_b:
                 pl = score_region(uc, cs, best=ranked_b[0])
@@ -560,6 +661,9 @@ def cmd_selftest(a):
                     res["verdict"] = ("truth inside reported plateau" if res["pass"] else "truth OUTSIDE plateau") + \
                                      f" ({pl['length_m']:.0f} m long)"
             results[f"one_event_{tag}_e{k + 1}"] = res
+    r2 = results["two_event_unknown_time"]
+    if (r2.get("trace_check") or {}).get("consistent") is False:  # the answer must reproduce both traced curves
+        r2["pass"], r2["verdict"] = False, "best hypothesis fails the trace check"
     ok = all(r["pass"] for r in results.values())
     out = {"pass": ok, "results": results, "event_fits": rep, "workdir": work, "runtime_s": time.time() - t_start}
     dump_json(out, os.path.join(work, "selftest.json"))
@@ -642,7 +746,7 @@ def main(argv=None):
 
     s = sub.add_parser("detect", help="find candidate fly-over boxes (sustained narrow-band tones)")
     s.add_argument("spec")
-    s.add_argument("--out", required=True)
+    s.add_argument("--out", required=True, help="event list (JSON array); detection info goes to <out>.diag.json")
     s.add_argument("--fmin", type=float, default=40)
     s.add_argument("--fmax", type=float, default=400)
     s.add_argument("--harmonics", type=int, default=1,
@@ -736,14 +840,16 @@ def main(argv=None):
     s.add_argument("--top-pairs", type=int, default=40)
     s.add_argument("--sub-m", type=float, default=100.0)
     s.add_argument("--half-window", type=float, default=60.0)
-    s.add_argument("--delta-max", type=float, default=4.0)
+    s.add_argument("--delta-max", type=float, default=4.0,
+                   help="time-shift range (s); widened to event 1's t_tol when that is larger")
     s.add_argument("--f-rel", type=float, default=0.006)
     s.add_argument("--heat-radius", type=float, default=1500.0)
     s.add_argument("--heat-step", type=float, default=30.0)
     s.add_argument("--region-frac", type=float, default=0.9)
     s.add_argument("--ambiguity-frac", type=float, default=0.9, help="flag alternatives scoring >= frac*best")
     s.add_argument("--rec-start", help="known recording start (UTC ISO/unix) - restricts the time shift")
-    s.add_argument("--rec-start-tol", type=float, default=5.0, help="clock tolerance (s) for --rec-start")
+    s.add_argument("--rec-start-tol", type=float,
+                   help="clock tolerance (s) for --rec-start (default: the search's, else 5)")
     s.add_argument("--no-heatmap", action="store_true")
     s.add_argument("--report", type=int, default=15)
     s.add_argument("--out", required=True)

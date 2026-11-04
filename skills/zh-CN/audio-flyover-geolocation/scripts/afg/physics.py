@@ -107,11 +107,41 @@ def _initial_guess(t, f, c):
     return np.array([f0, v, np.clip(d, 50, 30000), tc])
 
 
+def corr_time(res):
+    """Integrated autocorrelation time of time-ordered residuals (1 = independent).
+
+    1 + 2 * sum of the autocorrelation over lags, summed until it first drops
+    below 0.05.  n / corr_time is the effective number of independent points."""
+    r = np.asarray(res, float)
+    r = r - r.mean() if r.size else r
+    v = float(np.dot(r, r))
+    if r.size < 10 or v <= 0:
+        return 1.0
+    tau = 1.0
+    for k in range(1, r.size // 4):
+        rho = float(np.dot(r[:-k], r[k:])) / v
+        if rho < 0.05:
+            break
+        tau += 2.0 * rho
+    return tau
+
+
+def _inflation(res_sorted, corr_factor):
+    """Variance inflation for correlated residuals: the larger of the frame-overlap
+    factor (window/hop) and the measured residual correlation time.  The two
+    describe the same correlation, so they are not multiplied."""
+    tau = corr_time(res_sorted)
+    return max(corr_factor**2, tau), tau
+
+
 def fit_linear(t, f, c=343.0, weights=None, corr_factor=1.0, robust=True):
     """Fit the closed-form linear-pass model to traced (t, f) points.
 
     corr_factor: sqrt(window/hop) of the spectrogram - adjacent frames are not
-    independent, so formal sigmas are inflated by this factor.
+    independent, so formal sigmas are inflated by this factor.  When the
+    residuals stay correlated for longer than the window (a turn, a speed or
+    power change, or a tracer that follows a smooth wrong path), the measured
+    correlation time is used instead (see `corr_time`).
     Returns dict with params, 1-sigma errors, residual diagnostics.
     """
     t = np.asarray(t, float)
@@ -154,13 +184,15 @@ def fit_linear(t, f, c=343.0, weights=None, corr_factor=1.0, robust=True):
     res_in = doppler_linear(t[inl], *x, c) - f[inl]
     n, p = inl.sum(), 4
     s2 = float(np.sum((res_in * w[inl]) ** 2) / max(n - p, 1))
+    infl, tau = _inflation(res_in[np.argsort(t[inl], kind="stable")], corr_factor)
     J = r2.jac
     try:
-        cov = np.linalg.inv(J.T @ J) * s2 * corr_factor**2
+        cov = np.linalg.inv(J.T @ J) * s2 * infl
         sig = np.sqrt(np.clip(np.diag(cov), 0, None))
     except np.linalg.LinAlgError:
         cov = np.full((4, 4), np.nan)
         sig = np.full(4, np.nan)
+    rho_vd = float(cov[1, 2] / np.sqrt(cov[1, 1] * cov[2, 2])) if np.all(np.isfinite(cov)) and cov[1, 1] > 0         and cov[2, 2] > 0 else np.nan
     res_all = doppler_linear(t, *x, c) - f
     left = t < x[3]
     rms_l = float(np.sqrt(np.mean(res_all[left & inl] ** 2))) if (left & inl).any() else np.nan
@@ -172,6 +204,8 @@ def fit_linear(t, f, c=343.0, weights=None, corr_factor=1.0, robust=True):
         "rms_hz": float(np.sqrt(np.mean(res_in**2))),
         "rms_left_hz": rms_l, "rms_right_hz": rms_r,
         "n_points": int(len(t)), "n_inliers": int(n),
+        "resid_corr_time": float(tau), "sigma_inflation": float(np.sqrt(infl)), "n_eff": float(n / infl),
+        "corr_v_d": rho_vd,
         "f_hi_asym": x[0] / (1 - x[1] / c), "f_lo_asym": x[0] / (1 + x[1] / c),
         "cpa_slope_hz_s": cpa_slope(x[0], x[1], x[2], c),
         "c": c,
@@ -206,8 +240,9 @@ def fit_split(t, f, lin, c=343.0, corr_factor=1.0):
     n, p = inl.sum(), 5
     rr = resid(x)
     s2 = float(np.sum(rr**2) / max(n - p, 1))
+    infl, _ = _inflation(rr[np.argsort(tt, kind="stable")], corr_factor)
     try:
-        cov = np.linalg.inv(r.jac.T @ r.jac) * s2 * corr_factor**2
+        cov = np.linalg.inv(r.jac.T @ r.jac) * s2 * infl
         sig = np.sqrt(np.clip(np.diag(cov), 0, None))
     except np.linalg.LinAlgError:
         sig = np.full(5, np.nan)
@@ -262,6 +297,9 @@ def search_constraints(fit, v_rel_margin=0.20, d_rel_margin=0.15, t_margin_s=4.0
         "k_min": k_min, "k_max": k_max,
         "d_min": max(min(d - dd, v_min**2 / k_max), 30.0), "d_max": max(d + dd, v_max**2 / k_min),
         "t_rec": fit["t_cpa_rx"], "t_tol": dt,
+        # the distance the fit itself supports (+-nsig sigma), for comparison with the search window above,
+        # which follows from the speed and k windows and is deliberately much wider
+        "d_fit_min": max(d - nsig * np.nan_to_num(s["d"], nan=d * 0.3), 0.0), "d_fit_max": d + nsig * np.nan_to_num(s["d"], nan=d * 0.3),
         "f0": fit["f0"], "f0_rel_tol": max(0.004, 3 * np.nan_to_num(s["f0"], nan=0) / fit["f0"]),
     }
 
@@ -276,7 +314,8 @@ def plausibility(fit, v_max=150.0, d_max=15000.0, rel_sigma_max=0.5):
     """
     why = []
     if not np.isfinite(fit["v"]) or fit["v"] > v_max:
-        why.append(f"v={fit['v']:.0f} m/s > {v_max:.0f} (trace probably followed noise or switched harmonics)")
+        why.append(f"v={fit['v']:.0f} m/s > {v_max:.0f} (trace probably followed noise or switched harmonics, or "
+                   "covers only a short piece of the curve: if it rises before it falls, re-trace with --no-monotone)")
     if not np.isfinite(fit["d"]) or fit["d"] > d_max:
         why.append(f"d={fit['d']:.0f} m > {d_max:.0f} (no usable curvature)")
     for k in ("v", "d"):

@@ -66,8 +66,16 @@ Harmonics: if you traced the n-th harmonic, f0 → n·f0; v and d are unchanged 
 - In the search, each candidate aircraft computes k = gs²/d_cpa from **its own ADS-B ground speed** and is
   checked against the k window. This is more precise than bounding v and d independently, and much less likely
   to drop the true answer.
-- tCPA uncertainty is usually < 1 s. Correlated frames (window/hop) make formal errors too small, so the script
-  inflates the covariance by √(win/hop).
+- tCPA uncertainty is usually < 1 s.
+- **Fit uncertainties.** Adjacent frames overlap (window/hop), and the residuals of a real pass stay correlated
+  for longer still (a turn, a power change, a tracer following a smooth wrong path). The script measures the
+  residual correlation time τ = 1 + 2·Σρ_k (summed until ρ drops below 0.05) and inflates the covariance by
+  max(win/hop, τ). They are not multiplied, because both describe the same correlation. The fit output has
+  `resid_corr_time`, `sigma_inflation` and `n_eff`. In the self-test scenarios τ is 3–38 points, so sigmas
+  grow by up to 2.7× over the overlap factor alone; on straight synthetic passes τ ≈ 2 and nothing changes.
+- **Sigma is statistical only.** An acceleration before CPA biases the fitted v by far more than sigma (about
+  10 σ for the self-tests' event 2). That is why the search relies on wide speed windows and the k window, not
+  on sigma. `corr_v_d` (typically 0.8–0.9) shows how strongly v and d trade off along k = v²/d.
 
 ## 5. Sound speed, temperature, wind
 
@@ -86,6 +94,7 @@ Harmonics: if you traced the n-th harmonic, f0 → n·f0; v and d are unchanged 
 | Turn after CPA | One asymptote not flat; left/right residual asymmetry | `fit` adds an asymmetry note; scoring uses the real track, and the turn actually **removes the mirror** |
 | Acceleration/deceleration, change of climb rate | Different "apparent speeds" on approach and recede | `fit_split` (separate v per side) + union of windows; rely on the k window |
 | Orbiting/hovering (helicopter) | Curve may rise or fall | `trace --no-monotone`; usually better to use another event |
+| Turning towards the microphone before CPA | Curve rises for a while, then falls | `trace --no-monotone` (`trace` hints at it when the default trace keeps only a short piece) |
 
 ## 7. Sources
 

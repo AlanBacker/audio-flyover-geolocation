@@ -167,6 +167,11 @@ def run_search(R, flights, events, dem, bbox=None, grid_m=200.0, c=343.0, rec_st
     nlat, nlon = grid.node_latlon(node_ids)
     nelev = dem.sample(nlat, nlon)
     necef = geodetic_to_ecef(nlat, nlon, nelev + mic_height)
+    if rec_start is not None:
+        stats["clock"] = {"rec_start": float(rec_start), "rec_start_tol": float(rec_start_tol or 0)}
+    stats["ground_elev_m"] = {"source": "constant" if dem.is_constant else "dem",
+                              "min": float(nelev.min()) if nelev.size else None,
+                              "max": float(nelev.max()) if nelev.size else None}
 
     ev1 = cpa_events(necef, R, s1, e1["d_max"] * 1.02, c)
     ok = (~ev1["edge"]) & _in_window(ev1["d"], e1["d_min"], e1["d_max"]) & _in_window(ev1["gs"], e1["v_min"], e1["v_max"])
@@ -230,6 +235,12 @@ def run_search(R, flights, events, dem, bbox=None, grid_m=200.0, c=343.0, rec_st
         stats["nodes_after_silence"] = int(np.unique(ev1["node"][pairs[:, 0]]).size) if len(pairs) else 0
         log(f"C: {len(pairs)} pairs survive silence filter at {stats['nodes_after_silence']} nodes")
 
+    if len(events) >= 2 and len(pairs):
+        stats["crossing_angle_deg"] = _crossing_stats(R, ev1["j"][pairs[:, 0]], ev2["j"][pairs[:, 1]])
+        if stats["crossing_angle_deg"]["pairs_below_25"] == len(pairs):
+            log("B: every remaining pair of tracks crosses at < 25 deg - two events then only give a strip "
+                "along the tracks, not a point")
+
     # ---- assemble ----------------------------------------------------------
     cand = np.zeros(len(pairs), CAND_DTYPE)
     if len(pairs):
@@ -244,18 +255,44 @@ def run_search(R, flights, events, dem, bbox=None, grid_m=200.0, c=343.0, rec_st
             cand["fid2"][has2], cand["t2_cpa"][has2], cand["t2_rx"][has2] = b["fid"], b["t_cpa"], b["t_rx"]
             cand["d2"][has2], cand["v2"][has2] = b["d"], b["gs"]
     stats["candidates"] = int(len(cand))
+    stats["flight_pairs"] = int(np.unique(np.c_[cand["fid1"], cand["fid2"]], axis=0).shape[0]) if len(cand) else 0
+    if len(events) == 1 and stats["flight_pairs"] > 1:
+        log(f"{stats['flight_pairs']} different aircraft can explain the event - one event fits every aircraft with a "
+            "matching speed and distance; a second event, a tight clock or a small area is needed for a point")
     return cand, stats
 
 
+def _crossing_stats(R, j1, j2, min_deg=25.0):
+    """Crossing angle (0-90 deg) between the two tracks at their CPAs, over all pairs."""
+    h1 = np.degrees(np.arctan2(R.ve[j1], R.vn[j1]))
+    h2 = np.degrees(np.arctan2(R.ve[j2], R.vn[j2]))
+    x = np.abs(h1 - h2) % 180.0
+    a = np.minimum(x, 180.0 - x)
+    return {"min": float(a.min()), "median": float(np.median(a)), "max": float(a.max()),
+            "pairs_below_25": int((a < min_deg).sum())}
+
+
 def _pair(ev1, ev2, dT, tol, allow_same_aircraft=True):
+    """All (i1, i2) with the same node and |t_rx2 - t_rx1 - dT| <= tol.
+
+    Node and time go into one int64 key per event: the node's dense rank times
+    a slot wide enough for every time involved, plus the time in milliseconds.
+    Ranking first keeps the key small and exact for any node ids (also the
+    global Grid ids, ~1e14), and integer keys cannot lose the time term."""
     if ev1.size == 0 or ev2.size == 0:
         return np.zeros((0, 2), np.int64)
-    o2 = np.lexsort((ev2["t_rx"], ev2["node"]))
-    n2, t2 = ev2["node"][o2], ev2["t_rx"][o2]
-    tref = min(ev1["t_rx"].min(), t2.min())
-    key2 = n2.astype(np.float64) * 1e7 + (t2 - tref)
-    k_lo = ev1["node"].astype(np.float64) * 1e7 + (ev1["t_rx"] + dT - tol - tref)
-    k_hi = ev1["node"].astype(np.float64) * 1e7 + (ev1["t_rx"] + dT + tol - tref)
+    nodes, inv = np.unique(np.r_[ev2["node"], ev1["node"]], return_inverse=True)
+    r2, r1 = inv[:ev2.size].astype(np.int64), inv[ev2.size:].astype(np.int64)
+    pad = abs(dT) + tol + 1.0
+    t0 = min(ev1["t_rx"].min(), ev2["t_rx"].min()) - pad
+    slot = int(np.ceil((max(ev1["t_rx"].max(), ev2["t_rx"].max()) + pad - t0) * 1000.0)) + 1
+    if nodes.size * float(slot) >= 2.0**62:
+        raise RuntimeError("too many nodes x time span for exact pairing - split the time window")
+    key2 = r2 * slot + np.round((ev2["t_rx"] - t0) * 1000.0).astype(np.int64)
+    o2 = np.argsort(key2, kind="stable")
+    key2 = key2[o2]
+    k_lo = r1 * slot + np.floor((ev1["t_rx"] + dT - tol - t0) * 1000.0).astype(np.int64)
+    k_hi = r1 * slot + np.ceil((ev1["t_rx"] + dT + tol - t0) * 1000.0).astype(np.int64)
     a = np.searchsorted(key2, k_lo, "left")
     b = np.searchsorted(key2, k_hi, "right")
     cnt = b - a
