@@ -100,10 +100,13 @@ traced points:
 - pass when rms ≤ max(4 × reference, reference + 1 Hz). A model that does not reach the traced CPA (wrong
   time, no track there) fails.
 
-On the six self-test seeds the true two-event answers stay within 1.0–1.9 × the reference. Wrong sites and
-wrong aircraft pairs exceed 15 × on at least one event. With **two events**, hypotheses that fail are ranked
-below all others, alternatives and margins are computed among those that pass, and if none passes the verdict
-is `NO CONSISTENT SITE`. With **one event** the check is reported but does not reorder: other aircraft with
+On the six self-test seeds the true two-event answers stay at 0.3–1.8 × the reference per event (below 1
+where the real track follows a speed change that the fit's straight pass cannot). Wrong aircraft pairs
+exceed 15 × on at least one event. The true pair at a site 2–6 km away reaches 2.7–15 ×, so some of those
+pass: the check rules out wrong aircraft, not every wrong site, and the brightness score still ranks those
+below the true site. With **two events**, hypotheses that fail are ranked below all others, alternatives
+and margins are computed among those that pass, and if none passes the verdict is `NO CONSISTENT SITE`.
+With **one event** the check is reported but does not reorder: other aircraft with
 a similar speed and distance reproduce one curve too (in the self-tests, wrong aircraft 30 km away pass at
 1.3 ×).
 

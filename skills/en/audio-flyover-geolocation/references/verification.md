@@ -86,7 +86,7 @@ Scenario:
 | One event, clock ±2 s, straight pass | 6–213 m (4/6); in the other 2/6 the mirror side scores slightly higher, and the truth is the flagged mirror alternative |
 | One event, clock ±30 s | 2–5 km strips, truth always inside the strip |
 
-In every seed the two-event answer passes the trace check (robust RMS 1.0–1.9 × the fit's own).
+In every seed the two-event answer passes the trace check (robust RMS 0.3–1.8 × the fit's own).
 
 This is idealised synthetic data (no ADS-B gaps, no wind, no multipath); expect larger errors on real footage.
 It shows **that the pipeline is correct and that its uncertainty reporting is honest**. It is not a real-world

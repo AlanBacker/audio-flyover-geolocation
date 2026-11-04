@@ -264,10 +264,12 @@ def trace_check(R, hyps, events, traces, fits, c=343.0, mic_height=2.0, half_w=6
     square root of the median squared residual.  The reference is the same
     statistic for the linear fit; an event passes when
         rms <= max(ratio_max * ref, ref + slack_hz).
-    On the synthetic self-tests the true answer stays within 1.6 x ref, while
-    wrong sites and wrong aircraft pairs exceed 15 x ref on at least one event.
-    One event alone is weaker: other aircraft with a similar speed and distance
-    reproduce the curve too."""
+    On the synthetic self-tests the true two-event answer stays within 1.9 x
+    ref, and wrong aircraft pairs exceed 15 x ref on at least one event.  The
+    true pair at a site 2-6 km away reaches 2.7-15 x, so some of those pass;
+    the brightness score still ranks them below the true site.  One event alone
+    is weaker: other aircraft with a similar speed and distance reproduce the
+    curve too."""
     model = CurveModel(R, c)
     nev = len(events)
     for r in hyps:
